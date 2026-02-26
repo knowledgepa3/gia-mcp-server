@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.knowledgepa3/gia-mcp-server",
-  "description": "Governance Intelligence Architecture — enterprise governance layer for Claude AI agents. MAI decision classification, forensic audit trails, human-in-the-loop gates, compliance mapping (NIST, EU AI Act, ISO 42001), governed memory packs, and site reliability tools.",
+  "description": "Enterprise AI governance: audit trails, compliance, human-in-the-loop gates for Claude.",
   "repository": {
     "url": "https://github.com/knowledgepa3/gia-mcp-server",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "gia-mcp-server",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       },

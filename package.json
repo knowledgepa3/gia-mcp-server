@@ -1,6 +1,6 @@
 {
   "name": "gia-mcp-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP proxy for GIA Governance — connects Claude Desktop and Claude Code to the hosted GIA governance engine.",
   "author": {
     "name": "William J. Storey III",

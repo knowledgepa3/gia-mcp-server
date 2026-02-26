@@ -32,7 +32,7 @@ import {
   type JSONRPCRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const DEFAULT_SERVER_URL = 'https://gia.aceadvising.com/mcp';
 
 // Result schema map — tells the SDK how to validate upstream responses

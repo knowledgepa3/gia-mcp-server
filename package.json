@@ -38,6 +38,7 @@
     "url": "https://github.com/knowledgepa3/gia-mcp-server"
   },
   "homepage": "https://gia.aceadvising.com",
+  "mcpName": "io.github.knowledgepa3/gia-mcp-server",
   "engines": {
     "node": ">=18.0.0"
   },

@@ -11,6 +11,10 @@ This package connects [Claude Desktop](https://claude.ai/download) and [Claude C
 
 Built on Anthropic's [Model Context Protocol](https://modelcontextprotocol.io).
 
+<a href="https://glama.ai/mcp/servers/@knowledgepa3/gia-mcp-server">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@knowledgepa3/gia-mcp-server/badge" alt="GIA Server MCP server" />
+</a>
+
 ## Why GIA?
 
 AI agents are powerful — but **ungoverned AI agents are a liability**. GIA solves this by providing:

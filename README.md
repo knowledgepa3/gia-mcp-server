@@ -1,146 +1,155 @@
-# GIA MCP Server
+# GIA Governance Intelligence Automation
 
-[![npm version](https://img.shields.io/npm/v/gia-mcp-server)](https://www.npmjs.com/package/gia-mcp-server)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
-[![MCP](https://img.shields.io/badge/protocol-MCP-purple)](https://modelcontextprotocol.io)
+**Enterprise AI governance through the Model Context Protocol.**
 
-**Governance Intelligence Architecture** — the governance layer for Claude AI agents.
+GIA is a production governance engine that gives AI agents enforceable decision controls, compliance scoring, immutable audit chains, and human-in-the-loop gates. Built for organizations operating under NIST, FedRAMP, CMMC, EU AI Act, and SOC 2 requirements.
 
-This package connects [Claude Desktop](https://claude.ai/download) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to the hosted GIA governance engine, giving your AI workflows enterprise-grade governance: decision classification, forensic audit trails, human-in-the-loop gates, compliance mapping, and more.
-
-Built on Anthropic's [Model Context Protocol](https://modelcontextprotocol.io).
-
-<a href="https://glama.ai/mcp/servers/@knowledgepa3/gia-mcp-server">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@knowledgepa3/gia-mcp-server/badge" alt="GIA Server MCP server" />
-</a>
-
-## Why GIA?
-
-AI agents are powerful — but **ungoverned AI agents are a liability**. GIA solves this by providing:
-
-- **Decision Classification** — Every AI decision is classified as Mandatory (human required), Advisory (human optional), or Informational (agent autonomous)
-- **Forensic Audit Trail** — Hash-chained, tamper-evident ledger of every operation, decision, and gate approval
-- **Human-in-the-Loop Gates** — High-impact actions require explicit human approval before execution
-- **Compliance Mapping** — Map governance controls to NIST AI RMF, EU AI Act, ISO 42001, and NIST 800-53
-- **Governed Memory** — Hash-sealed knowledge packs with trust levels, TTL, and role-based access
-
-GIA is the governance layer that makes Claude deployments enterprise-ready.
+29 MCP tools. One integration point. Works with Claude Desktop, Claude Code, OpenAI Agent Builder, and any MCP-compatible client.
 
 ## Quick Start
 
-### 1. Get an API Key
+```bash
+npx gia-mcp-server
+```
 
-Visit [gia.aceadvising.com](https://gia.aceadvising.com) to create an account and generate an API key.
+Or install globally:
 
-### 2. Configure Claude Desktop
+```bash
+npm install -g gia-mcp-server
+gia-mcp-server
+```
+
+The server connects to the hosted GIA engine at `https://gia.aceadvising.com`. Configure your API key:
+
+```bash
+GIA_API_KEY=your-key npx gia-mcp-server
+```
+
+### Claude Desktop
 
 Add to your `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "gia": {
+    "gia-governance": {
       "command": "npx",
       "args": ["-y", "gia-mcp-server"],
       "env": {
-        "GIA_API_KEY": "gia_your_api_key_here"
+        "GIA_API_KEY": "your-key"
       }
     }
   }
 }
 ```
 
-### 3. Configure Claude Code
+### Claude Code
 
 ```bash
-claude mcp add gia -- npx -y gia-mcp-server
+claude mcp add gia-governance -- npx -y gia-mcp-server
 ```
 
-Then set your API key in your environment:
+### OpenAI Agent Builder
 
-```bash
-export GIA_API_KEY=gia_your_api_key_here
-```
-
-## How It Works
+Point to the Streamable HTTP endpoint:
 
 ```
-Claude Desktop/Code  <--stdio-->  gia-mcp-server  <--HTTPS-->  gia.aceadvising.com
-     (MCP Client)                  (this package)               (Governance Engine)
+https://gia.aceadvising.com/mcp
 ```
 
-This package is a lightweight proxy. All governance logic runs on the hosted GIA server — nothing is computed locally. When you add new tools or capabilities on the server, they appear automatically without updating this package.
+### Smithery
 
-## Available Tools
+```
+npx -y @smithery/cli install @knowledgepa3/gia-mcp-server --client claude
+```
 
-### Governance Core
+## Tools
+
+### Decision Controls (MAI Framework)
+
 | Tool | Description |
 |------|-------------|
-| `classify_decision` | Classify an AI agent decision using the MAI Framework |
-| `score_governance` | Compute weighted governance score from integrity, accuracy, and compliance values |
-| `evaluate_threshold` | Compute the Storey Threshold — governance health metric |
-| `assess_risk_tier` | Assess AI system risk tier with governance recommendations |
-| `map_compliance` | Map governance components to regulatory compliance frameworks |
-| `approve_gate` | Approve or reject a pending mandatory gate decision (human-in-the-loop) |
+| `classify_decision` | Classify agent decisions as Mandatory, Advisory, or Informational |
+| `approve_gate` | Human-in-the-loop approval for Mandatory gates |
+| `evaluate_threshold` | Compute escalation health (Storey Threshold) |
+| `score_governance` | Weighted governance scoring (Integrity, Accuracy, Compliance) |
 
-### Audit & Monitoring
+### Compliance & Audit
+
 | Tool | Description |
 |------|-------------|
 | `audit_pipeline` | Query the hash-chained forensic audit ledger |
-| `verify_ledger` | Verify integrity of the audit ledger hash chain |
-| `generate_report` | Generate a governance status report |
-| `system_status` | Get full system health and configuration |
-| `monitor_agents` | Monitor status and health of governed AI agents |
+| `verify_ledger` | Verify SHA-256 chain integrity from genesis |
+| `map_compliance` | Map controls to NIST AI RMF, EU AI Act, ISO 42001, NIST 800-53 |
+| `assess_risk_tier` | EU AI Act risk tier classification |
+| `generate_report` | Governance status reports (summary, detailed, executive) |
 
-### Governed Memory Packs
+### Knowledge Packs
+
 | Tool | Description |
 |------|-------------|
-| `seal_memory_pack` | Create a hash-sealed Governed Memory Pack |
-| `load_memory_pack` | Load a memory pack into agent context with validation |
-| `transfer_memory_pack` | Transfer a memory pack between agents via governed corridor |
-| `compose_memory_packs` | Compose multiple memory packs into a unified context |
-| `distill_memory_pack` | Distill governance patterns from usage history |
-| `promote_memory_pack` | Promote a memory pack to a higher trust level |
+| `seal_memory_pack` | Create immutable, TTL-bound knowledge artifacts |
+| `load_memory_pack` | Load packs with trust level and role enforcement |
+| `transfer_memory_pack` | Governed knowledge transfer between agents |
+| `compose_memory_packs` | Merge packs with risk contamination rules |
+| `distill_memory_pack` | Extract governance patterns from usage history |
+| `promote_memory_pack` | Promote packs to higher trust levels after review |
 
-### Site Reliability
+### Security & Operations
+
 | Tool | Description |
 |------|-------------|
-| `srt_run_watchdog` | Submit health check results to the SRT Watchdog |
-| `srt_diagnose` | Run diagnostician on an incident |
-| `srt_approve_repair` | Approve or reject a pending repair plan |
-| `srt_generate_postmortem` | Generate a structured postmortem report |
+| `monitor_agents` | Agent health, repair history, failure counts |
+| `srt_run_watchdog` | Infrastructure health probes (API, disk, memory, TLS, DB, DNS) |
+| `srt_diagnose` | Incident diagnosis with playbook matching |
+| `srt_approve_repair` | Human-approved repair execution |
+| `srt_generate_postmortem` | Structured incident postmortems with TTD/TTR metrics |
 
-### Infrastructure Operations
+### Infrastructure Remediation
+
 | Tool | Description |
 |------|-------------|
-| `gia_scan_environment` | Detect target environment (OS, containers, services) |
-| `gia_list_packs` | List available operations packs |
+| `gia_scan_environment` | Scout swarm for environment detection |
+| `gia_list_packs` | List remediation, patrol, hardening, and audit packs |
 | `gia_dry_run_pack` | Preview pack execution with blast radius analysis |
-| `gia_apply_pack` | Execute a remediation or hardening pack |
-| `gia_run_patrol` | Execute read-only patrol or audit checks |
+| `gia_apply_pack` | Execute remediation with mandatory human approval |
+| `gia_run_patrol` | Read-only posture checks and compliance audits |
 
-### Value & Impact
+### Impact & Value
+
 | Tool | Description |
 |------|-------------|
-| `record_value_metric` | Record a workflow value metric for ROI reporting |
-| `record_governance_event` | Record a governance event |
-| `generate_impact_report` | Generate economic and governance impact report |
+| `record_value_metric` | Track time saved, risks blocked, autonomy levels |
+| `record_governance_event` | Log gates, drift prevention, violations blocked |
+| `generate_impact_report` | Economic + governance ROI reporting |
+| `system_status` | Engine health, uptime, configuration |
 
-## Configuration
+## Architecture
 
-| Environment Variable | Required | Default | Description |
-|---------------------|----------|---------|-------------|
-| `GIA_API_KEY` | Yes | — | Your GIA API key |
-| `GIA_SERVER_URL` | No | `https://gia.aceadvising.com/mcp` | Custom server URL |
+GIA enforces governance through three layers:
 
-## Requirements
+1. **Decision Controls** — MAI classification gates side effects and high-impact actions
+2. **Step Hooks** — Workflow progression control at each pipeline stage
+3. **Kernel Hooks** — Resource control at the LLM boundary, including sub-agents
 
-- Node.js 18 or later
-- A GIA API key ([get one here](https://gia.aceadvising.com))
+Every governance action is recorded in a SHA-256 hash-chained audit ledger that can be independently verified.
+
+## Compliance Coverage
+
+- **NIST AI RMF** — Risk management framework mapping
+- **EU AI Act** — Risk tier assessment and control mapping
+- **ISO 42001** — AI management system alignment
+- **NIST 800-53** — Federal security control mapping
+- **CMMC 2.0** — DoD cybersecurity maturity
+- **FedRAMP** — Federal cloud authorization
+- **SOC 2** — Service organization controls
+
+## About
+
+Built by [Advanced Consulting Experts (ACE)](https://aceadvising.com) — a Service-Disabled Veteran-Owned Small Business (SDVOSB).
+
+GIA was designed by William J. Storey III, a 17-year Information System Security Officer with experience across DoD contracts and U.S. Army Ranger Battalion operations. The same discipline applied to securing classified systems now governs AI agent workforces.
 
 ## License
 
-MIT. See [LICENSE](LICENSE) for details.
-
-Copyright (c) 2025-2026 William J. Storey III / Advanced Consulting Experts (ACE)
+MIT

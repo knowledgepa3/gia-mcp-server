@@ -1,10 +1,10 @@
 {
   "name": "gia-mcp-server",
-  "version": "0.2.2",
-  "description": "MCP proxy for GIA Governance — connects Claude Desktop and Claude Code to the hosted GIA governance engine.",
+  "version": "0.3.1",
+  "description": "MCP server for GIA Governance — connects Claude Desktop, Claude Code, OpenAI Agent Builder, and any MCP client to the hosted GIA governance engine.",
   "author": {
     "name": "William J. Storey III",
-    "url": "https://github.com/aceadvising"
+    "url": "https://aceadvising.com"
   },
   "license": "MIT",
   "type": "module",
@@ -26,6 +26,8 @@
     "model-context-protocol",
     "anthropic",
     "claude",
+    "openai",
+    "agent-builder",
     "governance",
     "ai-safety",
     "compliance",

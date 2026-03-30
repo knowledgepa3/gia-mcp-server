@@ -63,6 +63,10 @@ https://gia.aceadvising.com/mcp
 npx -y @smithery/cli install @knowledgepa3/gia-mcp-server --client claude
 ```
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/knowledgepa3-gia-mcp-server).
+
 ## Tools
 
 ### Decision Controls (MAI Framework)

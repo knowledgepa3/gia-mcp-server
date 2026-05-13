@@ -8,6 +8,8 @@ GIA is a production governance engine that gives AI agents enforceable decision 
 
 ## Quick Start
 
+The governance engine runs fully embedded — no API key, no external dependency.
+
 ```bash
 npx gia-mcp-server
 ```
@@ -19,48 +21,41 @@ npm install -g gia-mcp-server
 gia-mcp-server
 ```
 
-The server connects to the hosted GIA engine at `https://gia.aceadvising.com`. Configure your API key:
+All 29 tools are available immediately. By default the engine runs in-memory. Add a Postgres connection string for persistent audit trails:
 
 ```bash
-GIA_API_KEY=your-key npx gia-mcp-server
+DATABASE_URL=postgresql://... npx gia-mcp-server
 ```
 
-### Claude Desktop
+### MCP Client Configuration
 
-Add to your `claude_desktop_config.json`:
+Add to your MCP client config (stdio transport):
 
 ```json
 {
   "mcpServers": {
     "gia-governance": {
       "command": "npx",
-      "args": ["-y", "gia-mcp-server"],
-      "env": {
-        "GIA_API_KEY": "your-key"
-      }
+      "args": ["-y", "gia-mcp-server"]
     }
   }
 }
 ```
 
-### Claude Code
+### Streamable HTTP (Remote)
 
-```bash
-claude mcp add gia-governance -- npx -y gia-mcp-server
-```
-
-### OpenAI Agent Builder
-
-Point to the Streamable HTTP endpoint:
+A hosted endpoint is available for frameworks that prefer HTTP transport:
 
 ```
 https://gia.aceadvising.com/mcp
 ```
 
+Requires `GIA_API_KEY` — contact [aceadvising.com](https://aceadvising.com) for access.
+
 ### Smithery
 
 ```
-npx -y @smithery/cli install @knowledgepa3/gia-mcp-server --client claude
+npx -y @smithery/cli install gia-mcp-server
 ```
 
 ## Tools

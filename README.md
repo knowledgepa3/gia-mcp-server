@@ -4,7 +4,7 @@
 
 GIA is a production governance engine that gives AI agents enforceable decision controls, compliance scoring, immutable audit chains, and human-in-the-loop gates. Built for organizations operating under NIST, FedRAMP, CMMC, EU AI Act, and SOC 2 requirements.
 
-29 MCP tools. One integration point. Works with Claude Desktop, Claude Code, OpenAI Agent Builder, and any MCP-compatible client.
+29 MCP tools. One integration point. Integrates with any MCP-compatible agent, framework, or client.
 
 ## Quick Start
 

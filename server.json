@@ -2,30 +2,30 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.knowledgepa3/gia-mcp-server",
   "title": "GIA Governance Intelligence Automation",
-  "description": "AI governance engine — decision controls, compliance, audit chains, knowledge packs.",
+  "description": "AI governance engine — decision controls, MAI classification, compliance mapping, forensic audit chains, and human-in-the-loop gates. Runs embedded (no remote server required).",
   "repository": {
     "url": "https://github.com/knowledgepa3/gia-mcp-server",
     "source": "github"
   },
-  "version": "0.3.1",
+  "version": "0.3.6",
   "websiteUrl": "https://gia.aceadvising.com",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "gia-mcp-server",
-      "version": "0.3.0",
+      "version": "0.3.6",
       "transport": {
         "type": "stdio"
       },
       "environment_variables": [
         {
-          "name": "GIA_API_KEY",
-          "description": "Your GIA API key (required). Get one at https://gia.aceadvising.com",
-          "required": true
+          "name": "DATABASE_URL",
+          "description": "PostgreSQL connection string for audit trail persistence (optional — governance engine works in-memory without it)",
+          "required": false
         },
         {
-          "name": "GIA_SERVER_URL",
-          "description": "Custom GIA server URL (optional, defaults to https://gia.aceadvising.com/mcp)",
+          "name": "GIA_API_KEY",
+          "description": "API key for the hosted GIA cloud platform (optional — only needed to connect to gia.aceadvising.com)",
           "required": false
         }
       ]

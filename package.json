@@ -1,21 +1,19 @@
 {
   "name": "gia-mcp-server",
-  "version": "0.3.1",
-  "description": "MCP server for GIA Governance — connects Claude Desktop, Claude Code, OpenAI Agent Builder, and any MCP client to the hosted GIA governance engine.",
+  "version": "0.3.6",
+  "description": "Runtime governance layer for generative AI agents. Works with any MCP-compatible client — Claude, GPT, Gemini, Cursor, or custom frameworks. MAI classification, forensic audit trails, human-in-the-loop gates, EU AI Act compliance, NIST/SOC 2/CMMC mapping.",
   "author": {
     "name": "William J. Storey III",
     "url": "https://aceadvising.com"
   },
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
-  "main": "dist/proxy.js",
-  "types": "dist/proxy.d.ts",
+  "main": "dist/index.js",
   "bin": {
     "gia-mcp-server": "bin/gia-mcp-server.js"
   },
   "files": [
-    "dist/proxy.js",
-    "dist/proxy.d.ts",
+    "dist/",
     "bin/",
     "LICENSE",
     "README.md",
@@ -26,34 +24,56 @@
     "model-context-protocol",
     "anthropic",
     "claude",
+    "governance",
+    "audit",
+    "compliance",
+    "nist",
+    "eu-ai-act",
+    "iso-42001",
+    "human-in-the-loop",
+    "ai-safety",
+    "forensic-ledger",
     "openai",
     "agent-builder",
-    "governance",
-    "ai-safety",
-    "compliance",
-    "audit",
-    "human-in-the-loop",
-    "forensic-ledger"
+    "ai-governance",
+    "ai-contract",
+    "soc2",
+    "cmmc",
+    "fedramp",
+    "sdvosb"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/knowledgepa3/gia-mcp-server"
   },
-  "homepage": "https://gia.aceadvising.com",
-  "mcpName": "io.github.knowledgepa3/gia-mcp-server",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
     "build": "tsc",
-    "start": "node dist/proxy.js",
-    "prepublishOnly": "npm run build"
+    "dev": "tsx watch src/mcp/server.ts",
+    "start": "node dist/index.js",
+    "start:http": "node dist/mcp/server-http.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:governance": "vitest run tests/core/",
+    "test:integration": "vitest run tests/integration/",
+    "test:smoke": "tsx tests/smoke/live-server.ts",
+    "lint": "eslint src/",
+    "onboard": "tsx src/onboarding/generate-client-config.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.26.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "pg": "^8.13.0",
+    "uuid": "^14.0.0",
+    "zod": "^3.22.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "typescript": "^5.3.0"
+    "@types/pg": "^8.16.0",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^3.2.4"
   }
 }

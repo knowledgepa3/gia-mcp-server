@@ -22,6 +22,8 @@
  * - Same DATABASE_URL as other persistence modules (same PostgreSQL)
  */
 
+import { bootNotice } from '../../shared/bootNotice.js';
+
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
 let persistenceEnabled = false;
@@ -96,7 +98,7 @@ export interface IntelligenceStats {
 export async function initIntelligencePersistence(): Promise<boolean> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('[Intel-Persist] No DATABASE_URL — intelligence data unavailable');
+    bootNotice('[Intel-Persist] No DATABASE_URL — intelligence data unavailable');
     return false;
   }
 

@@ -26,6 +26,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { GovernanceEngine } from '../../core/governance.js';
+import { MaiClassification, GiaLayer } from '../../shared/types.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // In-memory remediation state for MCP server process
@@ -1523,13 +1524,22 @@ export function registerApplyPackTool(server: McpServer, engine: GovernanceEngin
     },
     { title: 'Apply Remediation Pack', readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     async (input) => {
+      const entry = engine.ledger.begin(
+        'gia-apply-pack',
+        MaiClassification.MANDATORY,
+        GiaLayer.MCP,
+        input.approved_by || 'unknown',
+      );
+      entry.addMetadata('packId', input.pack_id);
+      entry.addMetadata('approverRole', input.approver_role);
+
       try {
-        // ── MANDATORY GATE: Validate approver ──
+        // ── Input validation: an identity must be supplied at all ──
         const approverLower = (input.approved_by || '').toLowerCase().trim();
         if (!input.approved_by || BLOCKED_APPROVERS.includes(approverLower)) {
           return { content: [{ type: 'text' as const, text: JSON.stringify({
             error: 'MANDATORY_GATE_VIOLATION',
-            message: `Blocked approver: "${input.approved_by}". Remediation pack execution requires human identity — MANDATORY gate enforced.`,
+            message: `Blocked approver: "${input.approved_by}". Remediation pack execution requires human identity.`,
             blockedApprovers: BLOCKED_APPROVERS.filter(a => a !== ''),
             resolution: 'Provide a real human operator identity (e.g. "storey", "isso-admin").',
           }, null, 2) }], isError: true };
@@ -1641,6 +1651,49 @@ export function registerApplyPackTool(server: McpServer, engine: GovernanceEngin
           }
         }
 
+        // ── MANDATORY gate enforcement — a real engine.gate.enforce() call, checked
+        // BEFORE the approval token / mutation below. Previously this tool's only
+        // "gate" was a check that approved_by wasn't a blocklisted string (system,
+        // auto, agent, bot, ai) — any other caller-supplied identity executed real
+        // remediation/hardening commands with no actual pending-approval workflow
+        // behind it (found 2026-07-14 MCP audit, the same self-report-trust bypass
+        // class named in the field guide given to Steelcase).
+        let gateDecision;
+        try {
+          gateDecision = await engine.gate.enforce(
+            MaiClassification.MANDATORY,
+            `gia-apply-pack:${input.pack_id}`,
+            entry.id,
+          );
+        } catch (gateError) {
+          const failedEntry = entry.fail(
+            gateError instanceof Error ? gateError : new Error(String(gateError)),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            message: `Remediation pack execution requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+            packId: input.pack_id,
+          }, null, 2) }], isError: true };
+        }
+        entry.addMetadata('gateId', gateDecision.gateId);
+        entry.addMetadata('gateStatus', gateDecision.status);
+        if (gateDecision.status !== 'APPROVED') {
+          const failedEntry = entry.fail(
+            new Error(`MANDATORY gate ${gateDecision.status} for gia_apply_pack`),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            gateId: gateDecision.gateId,
+            gateStatus: gateDecision.status,
+            message: 'Remediation pack execution requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.',
+            packId: input.pack_id,
+          }, null, 2) }], isError: true };
+        }
+
         // ── Create approval token ──
         const runId = generateId('RRUN');
         const tokenId = generateId('RTOKEN');
@@ -1720,6 +1773,15 @@ export function registerApplyPackTool(server: McpServer, engine: GovernanceEngin
           incidentId: input.incident_id || null,
         };
 
+        const score = engine.scorer.scoreDefault('gia-apply-pack');
+        const completedEntry = entry.complete(score, {
+          classification: MaiClassification.MANDATORY,
+          confidence: 1.0,
+          rationale: `Remediation pack applied: ${input.pack_id}`,
+          requiresGate: true,
+        });
+        engine.ledger.record(completedEntry);
+
         engine.telemetryService.emitToolCall('gia_apply_pack', `apply-${Date.now().toString(36)}`, 'MANDATORY', true);
 
         return { content: [{ type: 'text' as const, text: JSON.stringify({
@@ -1741,6 +1803,8 @@ export function registerApplyPackTool(server: McpServer, engine: GovernanceEngin
         }, null, 2) }] };
       } catch (error) {
         engine.telemetryService.emitToolCall('gia_apply_pack', `apply-${Date.now().toString(36)}`, 'MANDATORY', false);
+        const failedEntry = entry.fail(error instanceof Error ? error : new Error('Apply failed'), MaiClassification.MANDATORY);
+        engine.ledger.record(failedEntry);
         return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'APPLY_FAILED', message: String(error) }, null, 2) }], isError: true };
       }
     }
@@ -1751,6 +1815,11 @@ export function registerApplyPackTool(server: McpServer, engine: GovernanceEngin
 // TOOL 5: gia_run_patrol (ADVISORY or MANDATORY by sensitivity)
 // Executes patrol/audit packs — read-only posture checks + evidence
 // ═══════════════════════════════════════════════════════════════════
+
+/** Pure predicate: does this pack's data sensitivity require the MANDATORY gate? */
+export function isHighSensitivityPatrol(pack: { dataSensitivity: string }): boolean {
+  return pack.dataSensitivity === 'high';
+}
 
 export function registerRunPatrolTool(server: McpServer, engine: GovernanceEngine): void {
   server.tool(
@@ -1780,8 +1849,14 @@ export function registerRunPatrolTool(server: McpServer, engine: GovernanceEngin
           }, null, 2) }], isError: true };
         }
 
-        // ── Data sensitivity gate ──
-        if (pack.dataSensitivity === 'high') {
+        // ── Data sensitivity gate — a real engine.gate.enforce() call, checked
+        // before any findings/evidence are produced. Previously this only checked
+        // whether approved_by was a non-blocklisted string, the same self-report-
+        // trust bypass class fixed in transfer_memory_pack and gia_apply_pack
+        // (2026-07-14 MCP audit). No pack in the current library has
+        // dataSensitivity:'high', so this branch is currently unreachable in
+        // production — fixed as defense-in-depth for when one is added.
+        if (isHighSensitivityPatrol(pack)) {
           const approverLower = (input.approved_by || '').toLowerCase().trim();
           if (!input.approved_by || BLOCKED_APPROVERS.includes(approverLower)) {
             return { content: [{ type: 'text' as const, text: JSON.stringify({
@@ -1792,6 +1867,36 @@ export function registerRunPatrolTool(server: McpServer, engine: GovernanceEngin
               blockedApprovers: BLOCKED_APPROVERS.filter(a => a !== ''),
             }, null, 2) }], isError: true };
           }
+
+          const entry = engine.ledger.begin('gia-run-patrol-high-sensitivity', MaiClassification.MANDATORY, GiaLayer.MCP, input.approved_by);
+          entry.addMetadata('packId', input.pack_id);
+          let gateDecision;
+          try {
+            gateDecision = await engine.gate.enforce(MaiClassification.MANDATORY, `gia-run-patrol:${input.pack_id}`, entry.id);
+          } catch (gateError) {
+            const failedEntry = entry.fail(gateError instanceof Error ? gateError : new Error(String(gateError)), MaiClassification.MANDATORY);
+            engine.ledger.record(failedEntry);
+            return { content: [{ type: 'text' as const, text: JSON.stringify({
+              error: 'GATE_REQUIRED',
+              message: `High-sensitivity patrol requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+              packId: input.pack_id,
+            }, null, 2) }], isError: true };
+          }
+          entry.addMetadata('gateId', gateDecision.gateId);
+          entry.addMetadata('gateStatus', gateDecision.status);
+          if (gateDecision.status !== 'APPROVED') {
+            const failedEntry = entry.fail(new Error(`MANDATORY gate ${gateDecision.status} for gia_run_patrol`), MaiClassification.MANDATORY);
+            engine.ledger.record(failedEntry);
+            return { content: [{ type: 'text' as const, text: JSON.stringify({
+              error: 'GATE_REQUIRED',
+              gateId: gateDecision.gateId,
+              gateStatus: gateDecision.status,
+              message: 'High-sensitivity patrol requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.',
+              packId: input.pack_id,
+            }, null, 2) }], isError: true };
+          }
+          const score = engine.scorer.scoreDefault('gia-run-patrol-high-sensitivity');
+          engine.ledger.record(entry.complete(score, { classification: MaiClassification.MANDATORY, confidence: 1.0, rationale: `High-sensitivity patrol run: ${input.pack_id}`, requiresGate: true }));
         }
 
         // ── Verify hash integrity ──

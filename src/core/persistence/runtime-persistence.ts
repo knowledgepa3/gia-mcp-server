@@ -17,6 +17,8 @@
  * Migration: 036_runtime_accountability.sql
  */
 
+import { bootNotice } from '../../shared/bootNotice.js';
+
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
 let persistenceEnabled = false;
@@ -33,7 +35,7 @@ const MAX_METADATA_CHARS = 5000;
 export async function initRuntimePersistence(): Promise<boolean> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('[Runtime-Persist] No DATABASE_URL — running in-memory only');
+    bootNotice('[Runtime-Persist] No DATABASE_URL — running in-memory only');
     return false;
   }
 

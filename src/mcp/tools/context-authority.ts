@@ -31,7 +31,7 @@ import { MaiClassification, GiaLayer } from '../../shared/types.js';
 import { sanitize } from '../../shared/utils.js';
 import { GovernedError } from '../../shared/errors.js';
 import { getGMPPacksByFilter, type GMPPack } from './memory-packs.js';
-import { getComplianceMappings } from './map-compliance.js';
+import { getComplianceMappings, MAPPING_DISCLAIMER } from './map-compliance.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // Context Classes — what kind of knowledge is being requested
@@ -167,6 +167,9 @@ interface ContextEnvelope {
     };
     complianceMappings: {
       count: number;
+      // M12: design-mapping disclaimer travels WITH the data so an agent consuming
+      // the envelope cannot read status 'IMPLEMENTED' as certified/enforced.
+      disclaimer?: string;
       mappings: Array<{
         framework: string;
         control: string;
@@ -271,15 +274,69 @@ export function registerContextAuthorityTool(server: McpServer, engine: Governan
             allFiltered = broader;
           }
 
+          const resolvedPacks: GMPPack[] = [];
           for (const { pack, denialReason } of allFiltered) {
             if (denialReason) {
               denials.push({ source: 'memory_pack', reason: denialReason, detail: pack.memoryPackId });
               continue;
             }
-            // Elevate to MANDATORY if SYSTEM-trust content is accessed
-            if (pack.trustLevel === 'SYSTEM') {
-              maiLevel = MaiClassification.MANDATORY;
+            resolvedPacks.push(pack);
+          }
+
+          // MANDATORY gate enforcement — SYSTEM-trust pack content MUST go
+          // through a real human-in-the-loop gate BEFORE it is placed into
+          // the response envelope. Previously this only set a local
+          // `maiLevel = MANDATORY` variable that was surfaced cosmetically
+          // in the response and ledger metadata — the SYSTEM-trust content
+          // itself flowed through unconditionally, with no gate call
+          // anywhere in this file (fleet verification finding, 2026-07-14).
+          // The gate is checked BEFORE the content below is appended — a
+          // rejected/timed-out gate must return an error envelope with NO
+          // pack content, not a partially-filtered one.
+          const hasSystemTrust = resolvedPacks.some(p => p.trustLevel === 'SYSTEM');
+          if (hasSystemTrust) {
+            maiLevel = MaiClassification.MANDATORY;
+            let gateDecision;
+            try {
+              gateDecision = await engine.gate.enforce(
+                MaiClassification.MANDATORY,
+                `request-context:${input.agent_id}→SYSTEM-trust:${input.domain}`,
+                entry.id,
+              );
+            } catch (gateError) {
+              const failedEntry = entry.fail(
+                gateError instanceof Error ? gateError : new Error(String(gateError)),
+                MaiClassification.MANDATORY,
+              );
+              engine.ledger.record(failedEntry);
+              return { content: [{ type: 'text' as const, text: JSON.stringify({
+                error: 'GATE_REQUIRED',
+                message: `SYSTEM-trust context requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+                domain: input.domain,
+                contextClass: input.context_class,
+              }) }], isError: true };
             }
+            entry.addMetadata('gateId', gateDecision.gateId);
+            entry.addMetadata('gateStatus', gateDecision.status);
+
+            if (gateDecision.status !== 'APPROVED') {
+              const failedEntry = entry.fail(
+                new Error(`MANDATORY gate ${gateDecision.status} for SYSTEM-trust context request`),
+                MaiClassification.MANDATORY,
+              );
+              engine.ledger.record(failedEntry);
+              return { content: [{ type: 'text' as const, text: JSON.stringify({
+                error: 'GATE_REQUIRED',
+                gateId: gateDecision.gateId,
+                gateStatus: gateDecision.status,
+                message: 'SYSTEM-trust context requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.',
+                domain: input.domain,
+                contextClass: input.context_class,
+              }) }], isError: true };
+            }
+          }
+
+          for (const pack of resolvedPacks) {
             packResults.packs.push({
               packId: pack.memoryPackId,
               type: pack.type,
@@ -304,6 +361,17 @@ export function registerContextAuthorityTool(server: McpServer, engine: Governan
           docResults.chunks = retrieval.chunks.slice(0, input.max_results);
           docResults.count = docResults.chunks.length;
 
+          // An upstream retrieval failure (403/5xx/network) must surface as a
+          // denial — an empty envelope is indistinguishable from an empty corpus.
+          const retrievalApiError = (retrieval.stats as { error?: unknown })?.error;
+          if (retrievalApiError) {
+            denials.push({
+              source: 'governed_retrieval',
+              reason: 'RETRIEVAL_API_ERROR',
+              detail: String(retrievalApiError),
+            });
+          }
+
           for (const denied of retrieval.denied) {
             denials.push({
               source: 'governed_retrieval',
@@ -317,6 +385,7 @@ export function registerContextAuthorityTool(server: McpServer, engine: Governan
         let complianceResults: ContextEnvelope['sources']['complianceMappings'] = { count: 0, mappings: [] };
         if (routing.complianceFrameworks.length > 0 || input.include_compliance) {
           sourcesQueried.push('compliance_mappings');
+          complianceResults.disclaimer = MAPPING_DISCLAIMER;
           const frameworks = routing.complianceFrameworks.length > 0
             ? routing.complianceFrameworks
             : ['NIST_800_53', 'EU_AI_ACT', 'ISO_42001'];

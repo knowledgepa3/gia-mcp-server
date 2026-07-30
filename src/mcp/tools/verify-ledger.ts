@@ -6,15 +6,16 @@
  * @audit     false — verification itself does not modify the ledger
  * @owner     William J. Storey III / ACE / GIA
  *
- * Verify the integrity of the hash-chained forensic audit ledger.
+ * Verify the internal self-consistency of the hash-chained forensic audit ledger.
  *
- * This tool recomputes every SHA-256 hash in the chain from genesis
- * and compares against stored hashes. If any entry has been modified,
- * the chain breaks at that point and the tool reports the exact
- * location and nature of the break.
+ * HONEST SCOPE (rescoped 2026-07-01, STATE-OF-THE-LEDGER-VERIFIED-2026-06-30 §4):
+ * this tool walks the IN-MEMORY chain reconstruction, not persisted DB rows.
+ * It proves the in-memory chain is internally self-consistent and linkage-intact
+ * (append-only). It is NOT third-party content-verification and cannot detect
+ * a direct edit to a persisted database row. Persisted-row verification is
+ * verify_ledger_v2's job (Phase 5, ledger canonicalization v2).
  *
  * Classification: INFORMATIONAL — no mutations, no side effects.
- * This is a pure verification/compliance evidence tool.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -24,11 +25,16 @@ import { GENESIS_HASH, HASH_ALGORITHM, CHAIN_VERSION } from '../../shared/consta
 export function registerVerifyLedgerTool(server: McpServer, engine: GovernanceEngine): void {
   server.tool(
     'verify_ledger',
-    'Verify the integrity of the hash-chained forensic audit ledger. Recomputes every SHA-256 hash from genesis and reports whether the chain is intact. Classification: INFORMATIONAL — read-only, no side effects.',
+    'Check the internal self-consistency of the hash-chained forensic audit ledger. Walks the in-memory chain reconstruction (not persisted DB rows) and reports whether it is internally consistent and linkage-intact. Not third-party content-verification. Classification: INFORMATIONAL — read-only, no side effects.',
     {},
     { title: 'Verify Ledger Integrity', readOnlyHint: true, idempotentHint: true, destructiveHint: false, openWorldHint: false },
     async () => {
-      const result = engine.ledger.verifyChain();
+      // Full O(n) walk of the IN-MEMORY chain from genesis. The default verifyChain()
+      // is an incremental checkpoint walk; for an explicit audit request we walk the
+      // whole in-memory chain. NOTE: this is self-consistency over the process's own
+      // reconstruction — it does not re-read persisted DB rows and cannot detect a
+      // direct DB row edit (see module header; verify_ledger_v2 covers persisted rows).
+      const result = engine.ledger.verifyChainFull();
 
       // Tool accountability tracking
       engine.telemetryService.emitToolCall('verify_ledger', `verify-${Date.now().toString(36)}`, 'INFORMATIONAL', true);
@@ -44,21 +50,31 @@ export function registerVerifyLedgerTool(server: McpServer, engine: GovernanceEn
           chainVersion: CHAIN_VERSION,
           firstBrokenLink: result.firstBrokenLink,
           breakDetail: result.breakDetail ?? null,
+          // Honest split: recovered-from-DB entries are linkage-verified only
+          // (stored hash continuity); only in-process entries are content-verified.
+          linkageOnlyPrefix: result.linkageOnlyPrefix ?? null,
+          contentVerified: result.contentVerified ?? null,
+          // Permanent historical damage from the pre-2026-07-01 rewrite loop —
+          // recorded at recovery, reported on every walk, immutable by design.
+          // `chainIntegrity` reflects NEW breaks only; see verify_ledger_v2 for
+          // the persisted-row classification of these rows.
+          legacyLinkageBreaks: result.legacyLinkageBreaks ?? null,
           verifiedAt: result.verifiedAt.toISOString(),
           verificationDurationMs: result.verificationDurationMs,
           verificationMethod: {
-            type: 'full-chain-recomputation',
+            type: 'in-memory-self-consistency',
+            scope: 'Walks the in-memory chain reconstruction, NOT persisted DB rows. Cannot detect a direct edit to a persisted database row.',
             steps: [
-              'Walk append-only ledger from entry 0 through N',
+              'Walk the in-memory append-only log from entry 0 through N',
               'For each entry: recompute SHA-256(previousHash || canonicalizedEntry)',
-              'Verify recomputed hash matches stored entryHash',
+              'Verify recomputed hash matches the in-memory entryHash',
               'Verify each entry.previousHash matches prior entry.entryHash',
               'Verify final recomputed hash equals reported chainHead',
             ],
           },
           complianceNote: result.valid
-            ? 'Hash chain verified — tamper-evident audit trail is intact. Suitable for EU AI Act Article 12 (Record-Keeping) and NIST 800-53 AU (Audit and Accountability) compliance evidence.'
-            : `CHAIN INTEGRITY FAILURE at entry ${result.firstBrokenLink}. Audit trail tamper evidence detected. Investigate immediately.`,
+            ? 'Hash chain is internally self-consistent and linkage-intact (append-only). This walks the in-memory reconstruction, not persisted DB rows; it is not third-party content-verification. See verify_ledger_v2 for persisted-row verification.'
+            : `CHAIN SELF-CONSISTENCY FAILURE at entry ${result.firstBrokenLink}. The in-memory chain does not verify — investigate immediately.`,
         }, null, 2) }],
       };
     }

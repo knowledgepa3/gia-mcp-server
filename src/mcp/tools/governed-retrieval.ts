@@ -185,10 +185,13 @@ export function registerGovernedRetrievalTools(server: McpServer): void {
   // =========================================================================
   server.tool(
     'gia_ingest_document',
-    'Governed document ingestion — upload text content for governed retrieval. Content is chunked, embedded, hash-verified, and stored with full audit trail. Each chunk gets SHA-256 integrity hash. Classification: ADVISORY — creates governed content, audited.',
+    'Governed document ingestion — ingest a document into governed retrieval. Accepts raw text OR a base64-encoded file (PDF, DOCX, TXT, images). Hybrid extraction: text path first for cost efficiency, automatic Claude vision fallback for scanned/image-only PDFs (< 30 words/page triggers fallback). Content is chunked, embedded, hash-verified, and stored with full audit trail. Each chunk gets SHA-256 integrity hash. Classification: ADVISORY — creates governed content, audited.',
     {
       title: z.string().describe('Document title'),
-      content: z.string().describe('Full text content to ingest'),
+      content: z.string().optional().describe('Full text content to ingest (use this OR file_base64, not both)'),
+      file_base64: z.string().optional().describe('Base64-encoded file content — PDF, DOCX, TXT, MD, CSV, or image (PNG/JPG/WEBP/GIF). Hybrid extraction: text extraction attempted first (cheap), Claude vision fallback triggered automatically for scanned PDFs with < 30 words/page.'),
+      file_mime_type: z.string().optional().describe('MIME type for file_base64 (e.g. application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, image/png). Helps the server pick the right extractor.'),
+      filename: z.string().optional().describe('Original filename including extension — used to resolve format when mime type is ambiguous (e.g. document.pdf, report.docx)'),
       domain: z.string().describe('Domain classification (e.g., va-claims, finance, eu-ai-act)'),
       trust_level: z.enum(['SYSTEM', 'ORG', 'CASE', 'EPHEMERAL']).default('CASE').describe('Trust level (SYSTEM > ORG > CASE > EPHEMERAL)'),
       classification: z.enum(['MANDATORY', 'ADVISORY', 'INFORMATIONAL']).optional().describe('Document classification. Controls which retrievals can surface it when a classification floor is in force (MANDATORY > ADVISORY > INFORMATIONAL). Defaults to ADVISORY.'),
@@ -207,7 +210,9 @@ export function registerGovernedRetrievalTools(server: McpServer): void {
         const result = await apiCall<unknown>('/api/retrieval/ingest', 'POST', {
           title: args.title,
           content: args.content,
-          filename: `${args.title.toLowerCase().replace(/\s+/g, '-')}.txt`,
+          file_base64: args.file_base64,
+          file_mime_type: args.file_mime_type,
+          filename: args.filename ?? (args.content ? `${args.title.toLowerCase().replace(/\s+/g, '-')}.txt` : undefined),
           domain: args.domain,
           trustLevel: args.trust_level,
           classification: args.classification,
@@ -230,6 +235,7 @@ export function registerGovernedRetrievalTools(server: McpServer): void {
                 title: args.title,
                 domain: args.domain,
                 classification: args.classification,
+                ingestion_path: args.file_base64 ? 'file_base64' : args.content ? 'content' : 'unknown',
               }),
               null,
               2,

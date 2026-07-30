@@ -46,6 +46,22 @@ interface GiaHookConfig {
   operatorId: string;
   /** If true, MANDATORY gates block tool execution until approved. Default: true */
   enforceGates?: boolean;
+  /**
+   * Fail-safe posture when GIA governance is UNREACHABLE (the classify call
+   * throws — network error, 5xx, auth failure, timeout). This is distinct from
+   * a successful classification.
+   *   - 'closed' (default): deny any non-bypassed tool and notify the operator.
+   *     The agent cannot prove the action is governed, so secure-by-default
+   *     blocks it. Read-only tools on `bypassTools` are unaffected (they never
+   *     reach classification). This makes "governs everything" hold even when
+   *     GIA is down — the gap a security review probes first.
+   *   - 'open': allow with a warning (availability over safety). Use only when
+   *     an ungoverned action is acceptable for the domain. The pre-hardening
+   *     behavior.
+   * Ignored when `enforceGates` is false (advisory-only mode never blocks).
+   * Default: 'closed'
+   */
+  failSafe?: 'closed' | 'open';
   /** Gate approval timeout in ms. Default: 300000 (5 minutes) */
   gateTimeoutMs?: number;
   /** Tools that bypass governance (e.g. Read, Glob — read-only). Default: [] */
@@ -117,6 +133,7 @@ async function giaMcpCall(
  */
 export function createGiaGovernanceHooks(config: GiaHookConfig): Record<string, Array<{ matcher?: string; hooks: HookCallback[] }>> {
   const enforceGates = config.enforceGates ?? true;
+  const failSafe = config.failSafe ?? 'closed';
   const gateTimeoutMs = config.gateTimeoutMs ?? 300_000;
   const bypassTools = new Set(config.bypassTools ?? []);
 
@@ -189,11 +206,44 @@ export function createGiaGovernanceHooks(config: GiaHookConfig): Record<string, 
       return {};
 
     } catch (err: unknown) {
-      // Fail-open for classification errors (don't block agent on GIA network issues)
-      // but log the failure
+      // Governance-aware error handling: classification is UNAVAILABLE (GIA
+      // unreachable / 5xx / auth / timeout). We cannot prove this non-bypassed
+      // tool is safe — bypass (read-only) tools already returned above.
       const msg = err instanceof Error ? err.message : 'Unknown GIA error';
+
+      // Advisory-only mode (enforceGates=false) or explicit availability opt-in
+      // (failSafe='open') => fail open with a warning. This is the pre-hardening
+      // behavior, now gated behind explicit configuration.
+      if (!enforceGates || failSafe === 'open') {
+        return {
+          systemMessage: `[GIA] Governance classification unavailable (${msg}). Proceeding without gate enforcement.`,
+        };
+      }
+
+      // Secure-by-default: FAIL CLOSED. The action could not be governed, so it
+      // is denied and the operator is notified. The security decision must not
+      // depend on the notification succeeding, so it is best-effort.
+      if (config.onGateRequired) {
+        try {
+          await Promise.resolve(config.onGateRequired({
+            gateId: `gate-sdk-failclosed-${toolUseId ?? Date.now()}`,
+            operation: toolName,
+            classification: 'UNKNOWN',
+            toolName,
+            message: `GIA governance UNREACHABLE (${msg}). Tool "${toolName}" denied (fail-closed). Restore GIA connectivity, or set failSafe:'open' to allow ungoverned execution.`,
+          }));
+        } catch {
+          // Notification channel failure must not unblock the denial.
+        }
+      }
+
       return {
-        systemMessage: `[GIA] Governance classification unavailable (${msg}). Proceeding without gate enforcement.`,
+        systemMessage: `[GIA GOVERNANCE] Tool "${toolName}" DENIED — governance classification unavailable (${msg}) and fail-safe posture is 'closed'. The action could not be governed, so it was blocked. Operator notified.`,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: `GIA governance unreachable — fail-closed denial. Cannot verify MAI classification for "${toolName}".`,
+        },
       };
     }
   };

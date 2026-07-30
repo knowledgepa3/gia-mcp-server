@@ -64,6 +64,10 @@ interface GMPPack {
   };
 }
 
+// Maximum entries retained in the in-memory usage log.
+// Keeps memory bounded on long-running servers (lazy eviction on each push).
+const MAX_REPAIR_HISTORY = 100;
+
 const TRUST_RANK: Record<string, number> = { SYSTEM: 4, ORG: 3, CASE: 2, EPHEMERAL: 1 };
 const TRUST_MAX_TTL: Record<string, number> = { SYSTEM: 8760, ORG: 2160, CASE: 168, EPHEMERAL: 4 };
 const TRUST_SEAL_ROLES: Record<string, string[]> = {
@@ -75,6 +79,14 @@ const TRUST_SEAL_ROLES: Record<string, string[]> = {
 
 const gmpPacks = new Map<string, GMPPack>();
 const gmpUsageLog: Array<{ event: string; memoryPackId: string; agentId: string; runId: string; hash: string; approvedBy: string; timestamp: string }> = [];
+
+/** Push a usage event and evict oldest entries beyond MAX_REPAIR_HISTORY. */
+function pushUsageEvent(event: typeof gmpUsageLog[number]): void {
+  gmpUsageLog.push(event);
+  if (gmpUsageLog.length > MAX_REPAIR_HISTORY) {
+    gmpUsageLog.splice(0, gmpUsageLog.length - MAX_REPAIR_HISTORY);
+  }
+}
 
 function djb2Hash(str: string): string {
   let hash = 5381;
@@ -149,7 +161,7 @@ function ensureRecovery(): Promise<void> {
       // Recover usage log (needed for distill_memory_pack)
       const logRows = await recoverUsageLog();
       for (const row of logRows) {
-        gmpUsageLog.push({
+        pushUsageEvent({
           event: row.event,
           memoryPackId: row.memory_pack_id,
           agentId: row.agent_id,
@@ -441,7 +453,7 @@ export function registerSealMemoryPackTool(server: McpServer, engine: Governance
         persistPack(pack); // Write-through to PostgreSQL
 
         const usageEvent = { event: 'GMP_SEALED', memoryPackId: pack.memoryPackId, agentId: input.created_by, runId: 'seal', hash: pack.hash, approvedBy: pack.signedBy, timestamp: now };
-        gmpUsageLog.push(usageEvent);
+        pushUsageEvent(usageEvent);
         persistUsageEvent(usageEvent); // Write-through to PostgreSQL
 
         // Telemetry: seal success
@@ -486,6 +498,18 @@ export function registerLoadMemoryPackTool(server: McpServer, engine: Governance
           return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `Memory pack not found: ${input.pack_id}`, available: Array.from(gmpPacks.keys()) }) }], isError: true };
         }
 
+        // EPHEMERAL TTL enforcement on read — lazy expiry.
+        // If an EPHEMERAL pack has passed its expiresAt timestamp, treat it as
+        // missing (not-found) rather than returning stale data. No scheduled
+        // cleanup job is needed; expiry is enforced at every read boundary.
+        if (pack.trustLevel === 'EPHEMERAL' && new Date(pack.audit.expiresAt) < new Date()) {
+          gmpPacks.delete(input.pack_id); // Lazy eviction from in-memory store
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: `Memory pack not found: ${input.pack_id}`,
+            hint: 'EPHEMERAL pack has expired and been evicted. Re-seal a new pack if needed.',
+          }) }], isError: true };
+        }
+
         // Check status
         if (pack.status === 'REVOKED') {
           const promotedId = `${input.pack_id}-promoted`;
@@ -521,7 +545,7 @@ export function registerLoadMemoryPackTool(server: McpServer, engine: Governance
         persistPack(pack); // Write-through: usage + status update
 
         const loadEvent = { event: 'GMP_LOADED', memoryPackId: input.pack_id, agentId: input.agent_id, runId: input.run_id, hash: pack.hash, approvedBy: input.operator_role, timestamp: new Date().toISOString() };
-        gmpUsageLog.push(loadEvent);
+        pushUsageEvent(loadEvent);
         persistUsageEvent(loadEvent);
 
         const canAutomate = ['SYSTEM', 'ORG'].includes(pack.trustLevel);
@@ -578,7 +602,7 @@ export function registerTransferMemoryPackTool(server: McpServer, engine: Govern
 
       try {
         await seedDefaults();
-        if (!input.approved_by || input.approved_by === 'system') {
+        if (!input.approved_by) {
           return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'Memory transfers require human approval — MANDATORY gate', gateRequired: true }) }], isError: true };
         }
         const source = gmpPacks.get(input.source_pack_id);
@@ -587,6 +611,49 @@ export function registerTransferMemoryPackTool(server: McpServer, engine: Govern
         }
         if (source.status === 'EXPIRED' || source.status === 'REVOKED') {
           return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `Cannot transfer ${source.status} pack` }) }], isError: true };
+        }
+
+        // MANDATORY gate enforcement — a real engine.gate.enforce() call, checked
+        // BEFORE the transfer mutation below. Previously this only checked whether
+        // approved_by was a non-empty string that wasn't literally 'system' — any
+        // caller-supplied name was treated as a valid human approval, with no real
+        // gate/pending-approval workflow behind it (found 2026-07-14 MCP audit,
+        // the same self-report-trust bypass class named in the field guide given
+        // to Steelcase).
+        let gateDecision;
+        try {
+          gateDecision = await engine.gate.enforce(
+            MaiClassification.MANDATORY,
+            `transfer-memory-pack:${input.source_pack_id}→${input.target_agent_id}`,
+            entry.id,
+          );
+        } catch (gateError) {
+          const failedEntry = entry.fail(
+            gateError instanceof Error ? gateError : new Error(String(gateError)),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            message: `Memory transfer requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+            sourcePackId: input.source_pack_id,
+          }) }], isError: true };
+        }
+        entry.addMetadata('gateId', gateDecision.gateId);
+        entry.addMetadata('gateStatus', gateDecision.status);
+        if (gateDecision.status !== 'APPROVED') {
+          const failedEntry = entry.fail(
+            new Error(`MANDATORY gate ${gateDecision.status} for transfer`),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            gateId: gateDecision.gateId,
+            gateStatus: gateDecision.status,
+            message: 'Memory transfer requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.',
+            sourcePackId: input.source_pack_id,
+          }) }], isError: true };
         }
 
         // Create derived pack
@@ -621,7 +688,7 @@ export function registerTransferMemoryPackTool(server: McpServer, engine: Govern
         persistPack(derived); // Write-through
 
         const transferEvent = { event: 'GMP_TRANSFERRED', memoryPackId: input.source_pack_id, agentId: `${input.source_agent_id}→${input.target_agent_id}`, runId: derivedId, hash: derived.hash, approvedBy: input.approved_by, timestamp: now };
-        gmpUsageLog.push(transferEvent);
+        pushUsageEvent(transferEvent);
         persistUsageEvent(transferEvent);
 
         const score = engine.scorer.scoreDefault('transfer-memory-pack');
@@ -676,6 +743,14 @@ export function registerComposeMemoryPacksTool(server: McpServer, engine: Govern
         for (const id of input.pack_ids) {
           const pack = gmpPacks.get(id);
           if (!pack) return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `Pack not found: ${id}` }) }], isError: true };
+          // EPHEMERAL TTL enforcement on read — lazy expiry before compose
+          if (pack.trustLevel === 'EPHEMERAL' && new Date(pack.audit.expiresAt) < new Date()) {
+            gmpPacks.delete(id);
+            return { content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Pack not found: ${id}`,
+              hint: 'EPHEMERAL pack has expired and been evicted. Re-seal a new pack if needed.',
+            }) }], isError: true };
+          }
           if (pack.status === 'REVOKED' || pack.status === 'EXPIRED') {
             const promotedId = `${id}-promoted`;
             const promotedExists = gmpPacks.has(promotedId);
@@ -736,7 +811,7 @@ export function registerComposeMemoryPacksTool(server: McpServer, engine: Govern
         persistPack(composed); // Write-through
 
         const composeEvent = { event: 'GMP_COMPOSED', memoryPackId: input.composed_id, agentId: input.agent_id, runId: `compose:${input.pack_ids.join('+')}`, hash: composed.hash, approvedBy: input.operator_role, timestamp: now };
-        gmpUsageLog.push(composeEvent);
+        pushUsageEvent(composeEvent);
         persistUsageEvent(composeEvent);
 
         // Telemetry: compose success
@@ -910,6 +985,66 @@ export function registerPromoteMemoryPackTool(server: McpServer, engine: Governa
           return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `Role '${input.approver_role}' cannot seal ${input.target_trust} packs`, allowedRoles: allowed }) }], isError: true };
         }
 
+        // MANDATORY gate enforcement — promotion to SYSTEM or ORG trust MUST
+        // go through human-in-the-loop gate. This was identified as a vulnerability
+        // during red-team testing (2026-04-11): poisoned EPHEMERAL packs could be
+        // promoted to SYSTEM trust without gate enforcement.
+        //
+        // The gate is checked BEFORE any mutation below — a rejected/timed-out
+        // gate must leave the original pack untouched (still SEALED, not REVOKED)
+        // so a later, actually-approved attempt can still succeed. A prior version
+        // of this code persisted the promotion first and checked the gate after,
+        // which made the MANDATORY label cosmetic (found 2026-07-14 MCP audit).
+        // Fleet verification finding (2026-07-14): this previously gated only
+        // SYSTEM/ORG targets, leaving CASE-trust promotions to rely solely on
+        // TRUST_SEAL_ROLES.CASE — which permissively includes the self-reported
+        // 'agent' role with no human in the loop. Since promotion always requires
+        // TRUST_RANK[target_trust] > TRUST_RANK[pack.trustLevel] and EPHEMERAL is
+        // the lowest rank, nothing can ever be promoted TO EPHEMERAL — SYSTEM,
+        // ORG, and CASE are the only real promotion targets, so gating "true"
+        // unconditionally does not silently gate a target that shouldn't exist.
+        const requiresGate = true;
+        if (requiresGate) {
+          let gateDecision;
+          try {
+            gateDecision = await engine.gate.enforce(
+              MaiClassification.MANDATORY,
+              `promote-memory-pack:${input.pack_id}→${input.target_trust}`,
+              entry.id,
+            );
+          } catch (gateError) {
+            const failedEntry = entry.fail(
+              gateError instanceof Error ? gateError : new Error(String(gateError)),
+              MaiClassification.MANDATORY,
+            );
+            engine.ledger.record(failedEntry);
+            return { content: [{ type: 'text' as const, text: JSON.stringify({
+              error: 'GATE_REQUIRED',
+              message: `Promoting to ${input.target_trust} trust requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+              packId: input.pack_id,
+              targetTrust: input.target_trust,
+            }) }], isError: true };
+          }
+          entry.addMetadata('gateId', gateDecision.gateId);
+          entry.addMetadata('gateStatus', gateDecision.status);
+
+          if (gateDecision.status !== 'APPROVED') {
+            const failedEntry = entry.fail(
+              new Error(`MANDATORY gate ${gateDecision.status} for promotion to ${input.target_trust}`),
+              MaiClassification.MANDATORY,
+            );
+            engine.ledger.record(failedEntry);
+            return { content: [{ type: 'text' as const, text: JSON.stringify({
+              error: 'GATE_REQUIRED',
+              gateId: gateDecision.gateId,
+              gateStatus: gateDecision.status,
+              message: `Promoting to ${input.target_trust} trust requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.`,
+              packId: input.pack_id,
+              targetTrust: input.target_trust,
+            }) }], isError: true };
+          }
+        }
+
         const now = new Date().toISOString();
         const promotedId = `${input.pack_id}-promoted`;
         const promoted: GMPPack = {
@@ -933,40 +1068,8 @@ export function registerPromoteMemoryPackTool(server: McpServer, engine: Governa
         persistPack(pack); // Write-through: revoked status
 
         const promoteEvent = { event: 'GMP_PROMOTED', memoryPackId: promotedId, agentId: 'gia-promoter', runId: `promote:${input.pack_id}→${input.target_trust}`, hash: promoted.hash, approvedBy: input.approved_by, timestamp: now };
-        gmpUsageLog.push(promoteEvent);
+        pushUsageEvent(promoteEvent);
         persistUsageEvent(promoteEvent);
-
-        // MANDATORY gate enforcement — promotion to SYSTEM or ORG trust MUST
-        // go through human-in-the-loop gate. This was identified as a vulnerability
-        // during red-team testing (2026-04-11): poisoned EPHEMERAL packs could be
-        // promoted to SYSTEM trust without gate enforcement.
-        const requiresGate = input.target_trust === 'SYSTEM' || input.target_trust === 'ORG';
-        if (requiresGate) {
-          const gateDecision = await engine.gate.enforce(
-            MaiClassification.MANDATORY,
-            `promote-memory-pack:${input.pack_id}→${input.target_trust}`,
-            entry.id,
-          );
-          entry.addMetadata('gateId', gateDecision.gateId);
-          entry.addMetadata('gateStatus', gateDecision.status);
-
-          if (gateDecision.status !== 'APPROVED') {
-            const failedEntry = entry.fail(
-              new Error(`MANDATORY gate ${gateDecision.status} for promotion to ${input.target_trust}`),
-              MaiClassification.MANDATORY,
-            );
-            engine.ledger.record(failedEntry);
-            return { content: [{ type: 'text' as const, text: JSON.stringify({
-              error: 'GATE_REQUIRED',
-              gateId: gateDecision.gateId,
-              gateStatus: gateDecision.status,
-              message: `Promoting to ${input.target_trust} trust requires MANDATORY gate approval. Use approve_gate tool with gate ID to approve.`,
-              packId: input.pack_id,
-              targetTrust: input.target_trust,
-              contentPreview: promoted.content.principles?.slice(0, 3),
-            }) }], isError: true };
-          }
-        }
 
         const score = engine.scorer.scoreDefault('promote-memory-pack');
         const completedEntry = entry.complete(score, {
@@ -1036,7 +1139,13 @@ export async function getGMPPacksByFilter(filter: {
   const results: Array<{ pack: GMPPack; denialReason?: string }> = [];
   const now = new Date();
 
-  for (const [, pack] of gmpPacks) {
+  for (const [id, pack] of gmpPacks) {
+    // EPHEMERAL TTL enforcement on read — lazy eviction (no scheduled job).
+    if (pack.trustLevel === 'EPHEMERAL' && pack.audit.expiresAt && new Date(pack.audit.expiresAt) < now) {
+      gmpPacks.delete(id); // Evict stale EPHEMERAL pack
+      continue;            // Treat as missing — do not surface to caller
+    }
+
     // Type filter
     if (filter.types && filter.types.length > 0 && !filter.types.includes(pack.type)) continue;
     // Domain filter

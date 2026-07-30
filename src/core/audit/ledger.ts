@@ -26,16 +26,16 @@
  *  Using Cryptographically Attested Human-in-the-Loop Decision Gates"
  */
 
-import { createHash } from 'node:crypto';
-
 import {
   type IAuditEntry, type IGovernanceScore, type IGateDecision, type IMaiResult,
   MaiClassification, GiaLayer, EntryStatus,
 } from '../../shared/types.js';
-import { MAX_AUDIT_METADATA_SIZE, GENESIS_HASH, HASH_ALGORITHM } from '../../shared/constants.js';
+import { MAX_AUDIT_METADATA_SIZE, GENESIS_HASH } from '../../shared/constants.js';
+import { computeEntryHashV2, CHAIN_VERSION_V2 } from './canonicalV2.js';
+import { projectAuditEntryToV2 } from './projectToV2.js';
 import { generateAuditId, utcNow, durationMs, truncateMetadata } from '../../shared/utils.js';
 import { LedgerWriteError } from '../../shared/errors.js';
-import { persistEntry, recoverEntries, initLedgerPersistence, isPersistenceEnabled, getPersistedCount, closeLedgerPersistence, updateEntryHashes } from './ledger-persistence.js';
+import { persistEntry, recoverEntries, initLedgerPersistence, isPersistenceEnabled, getPersistedCount, closeLedgerPersistence } from './ledger-persistence.js';
 
 // ─── Result type for chain verification ────────────────────────────────────────
 
@@ -54,59 +54,31 @@ export interface IChainVerificationResult {
   verifiedAt: Date;
   /** Duration of verification in milliseconds. */
   verificationDurationMs: number;
+  /**
+   * Entries recovered from PostgreSQL that were LINKAGE-verified only
+   * (stored previous_hash → stored entry_hash continuity). Recovered rows may
+   * have been written by other writers with different historical preimages, so
+   * their content is NOT recomputed here — that is verify_ledger_v2's job.
+   */
+  linkageOnlyPrefix?: number;
+  /** Entries content-verified (hash recomputed and compared) in this walk. */
+  contentVerified?: number;
+  /**
+   * KNOWN legacy linkage breaks in the recovered prefix — permanent historical
+   * damage inherited from the pre-2026-07-01 recovery loop that rewrote
+   * hashes in place (partial fire-and-forget UPDATE bursts left stale
+   * previous_hash pointers). These rows are immutable and will never be
+   * "fixed"; the break set is recorded once at recovery and reported here on
+   * every walk. `valid` reflects NEW breaks only — a mismatch NOT in the
+   * recorded baseline still fails verification.
+   */
+  legacyLinkageBreaks?: number;
 }
 
-// ─── Canonical serialization ───────────────────────────────────────────────────
-
-/**
- * Produce a deterministic canonical JSON string from an audit entry.
- *
- * CRITICAL: This function MUST produce identical output for identical input,
- * regardless of object key insertion order. We sort keys recursively and
- * convert Dates to ISO strings. The entryHash, previousHash, and chainIndex
- * fields are EXCLUDED from the canonical form because they are the OUTPUT
- * of the hashing process, not the INPUT.
- *
- * This canonical form is what gets hashed. If you change this function,
- * every hash in the ledger becomes invalid. Do not modify without a
- * migration plan.
- */
-function canonicalize(entry: IAuditEntry): string {
-  return JSON.stringify(entry, (key, value) => {
-    // Exclude hash chain fields — they are computed, not source data
-    if (key === 'entryHash' || key === 'previousHash' || key === 'chainIndex') {
-      return undefined;
-    }
-    // Convert Date objects to ISO strings for deterministic serialization
-    if (value instanceof Date) {
-      return value.toISOString();
-    }
-    // Sort object keys for deterministic ordering
-    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-      const sorted: Record<string, unknown> = {};
-      for (const k of Object.keys(value).sort()) {
-        sorted[k] = value[k];
-      }
-      return sorted;
-    }
-    return value;
-  });
-}
-
-/**
- * Compute SHA-256 hash of (previousHash || canonicalEntryData).
- *
- * This is the core of the hash chain. Each entry's hash depends on:
- * 1. The previous entry's hash (chain integrity)
- * 2. The current entry's canonical data (entry integrity)
- *
- * Modifying any entry invalidates all subsequent hashes.
- */
-function computeEntryHash(previousHash: string, entry: IAuditEntry): string {
-  const canonical = canonicalize(entry);
-  const preimage = previousHash + '||' + canonical;
-  return createHash(HASH_ALGORITHM).update(preimage, 'utf8').digest('hex');
-}
+// ─── Canonical serialization + hashing ──────────────────────────────────────
+// Moved to ./canonical.ts — the SINGLE source of truth shared with
+// ledger-persistence.ts so the DB-persisted hash and the in-memory hash can
+// never diverge again (truth-map #6, 2026-06-29). computeEntryHash is imported.
 
 // ─── AuditEntryBuilder ─────────────────────────────────────────────────────────
 
@@ -215,6 +187,24 @@ export class ForensicLedger {
    */
   private verifyCheckpointIndex: number = -1;
   private verifyCheckpointHash: string = GENESIS_HASH;
+  /**
+   * Index of the last entry loaded from PostgreSQL during recovery, or -1 if
+   * this process started fresh. Entries at or below this index carry STORED
+   * hashes (possibly produced by other writers with different historical
+   * preimages) and are LINKAGE-verified only; entries above it were hashed by
+   * this process and are content-verifiable with this process's algorithm.
+   */
+  private recoveryBoundaryIndex: number = -1;
+  /**
+   * Log positions (array index) of recovered entries whose STORED previous_hash
+   * did not match the prior stored entry_hash — the known-legacy-break baseline
+   * recorded ONCE at recovery. verifyChain treats exactly these positions as
+   * documented historical damage (reported, never paged); any OTHER mismatch is
+   * a NEW break and fails verification. Without this baseline the integrity
+   * sentry would fire a MANDATORY gate at every boot, forever, for immutable
+   * history (gate-fatigue failure mode, incident 2026-07-01 gate-9d3f1c43).
+   */
+  private readonly legacyBreakPositions: Set<number> = new Set();
 
   /**
    * Initialize persistence and recover ledger state from PostgreSQL.
@@ -237,50 +227,73 @@ export class ForensicLedger {
     // Rebuild the in-memory chain from recovered entries.
     // Entries arrive sorted by chain_index ASC.
     //
-    // CRITICAL: We recompute the hash chain from the recovered entry data
-    // rather than trusting stored hashes. This ensures the in-memory chain
-    // is always consistent with the canonical form of recovered entries,
-    // even if prior persistence used lossy serialization (|| vs ??).
-    // Without this, verifyChain() would fail because the stored hashes
-    // were computed from the original in-memory data, which may differ
-    // from the round-tripped data after PostgreSQL serialization.
-    let recomputedCount = 0;
-    let currentHash = GENESIS_HASH;
+    // READ-ONLY RECOVERY (2026-07-01, STATE-OF-THE-LEDGER-VERIFIED-2026-06-30
+    // F-2): recovery NEVER rewrites the persisted ledger. The previous
+    // implementation recomputed every row's hash with THIS process's algorithm
+    // and UPDATE'd any "drifted" row back to the DB. Because the ledger is
+    // written by multiple writers with historically different preimages
+    // (Express auditStoreSecure, charterIntegritySentry, tenantProvisioning),
+    // every non-MCP row "drifted" on every restart — so recovery was silently
+    // rewriting other writers' rows AND would have laundered a genuine tamper
+    // (recompute over the edited body, overwrite the stored hash, destroy the
+    // evidence). Now: stored hashes are carried forward untouched, and the
+    // recovered prefix is LINKAGE-verified only (stored previous_hash must
+    // equal the prior row's stored entry_hash). Content verification of
+    // persisted rows is verify_ledger_v2's job, dispatched per algorithm epoch.
+    let linkageBreaks = 0;
+    let epoch2Drift = 0;
+    let prevStoredHash = GENESIS_HASH;
 
     for (const entry of entries) {
-      // Assign correct chain position and previous hash
-      const rehashedEntry: IAuditEntry = {
-        ...entry,
-        chainIndex: this.log.length,
-        previousHash: currentHash,
-      };
-
-      // Recompute hash from canonical form of recovered data
-      const recomputed = computeEntryHash(currentHash, rehashedEntry);
-      if (recomputed !== entry.entryHash) {
-        recomputedCount++;
-        // Sync recomputed hashes back to DB so the DB chain stays consistent
-        // across restarts. Fire-and-forget — never blocks recovery.
-        updateEntryHashes(this.log.length, recomputed, currentHash);
+      if (entry.previousHash !== prevStoredHash) {
+        linkageBreaks++;
+        // Record the position in the known-legacy-break baseline: reported on
+        // every verify walk, but only NEW breaks (not in this set) page.
+        this.legacyBreakPositions.add(this.log.length);
+        console.error(
+          `[ForensicLedger] LINKAGE BREAK in persisted chain at chain_index=${entry.chainIndex} ` +
+          `(op=${entry.operation}): stored previous_hash=${String(entry.previousHash).substring(0, 12)}... ` +
+          `!= prior stored entry_hash=${prevStoredHash.substring(0, 12)}... — NOT repaired (read-only recovery)`
+        );
       }
-      rehashedEntry.entryHash = recomputed;
 
-      const frozen = Object.freeze(rehashedEntry);
+      // Epoch-aware content ASSERT (report-only, design §7.1): epoch-2 rows
+      // were written with Ledger Canonical v2, so a recompute is meaningful.
+      // Epoch-1 rows are the heterogeneous legacy bucket — linkage-only.
+      if (entry.algoEpoch === CHAIN_VERSION_V2 && entry.previousHash) {
+        const recomputed = computeEntryHashV2(entry.previousHash, projectAuditEntryToV2(entry));
+        if (recomputed !== entry.entryHash) {
+          epoch2Drift++;
+          console.error(
+            `[ForensicLedger] EPOCH-2 CONTENT DRIFT at chain_index=${entry.chainIndex} ` +
+            `(op=${entry.operation}): stored entry_hash does not match v2 recompute — ` +
+            `possible row tamper. NOT repaired (read-only recovery); run verify_ledger_v2.`
+          );
+        }
+      }
+
+      // Keep the STORED chain fields exactly as persisted — no re-linking,
+      // no re-hashing, no UPDATE. The persisted ledger is the record.
+      const frozen = Object.freeze({ ...entry });
       const idx = this.log.length;
       this.log.push(frozen);
       this.latestByAuditId.set(entry.id, idx);
-      currentHash = recomputed;
+      prevStoredHash = entry.entryHash ?? prevStoredHash;
     }
 
-    this.headHash = currentHash;
-    // Recovery recomputes every hash — treat the full chain as verified.
+    this.headHash = prevStoredHash;
+    // The recovered prefix is LINKAGE-verified only, NOT content-verified.
+    // recoveryBoundaryIndex marks where trust-in-stored-hashes ends and
+    // in-process content verification begins; verifyChain(Full) uses it to
+    // avoid falsely recomputing other writers' rows with this algorithm.
+    this.recoveryBoundaryIndex = this.log.length - 1;
     this.verifyCheckpointIndex = this.log.length - 1;
-    this.verifyCheckpointHash = currentHash;
+    this.verifyCheckpointHash = prevStoredHash;
 
-    if (recomputedCount > 0) {
-      console.error(`[ForensicLedger] Recovered ${entries.length} entries, recomputed ${recomputedCount} hashes for chain consistency (head: ${this.headHash.substring(0, 12)}...)`);
+    if (linkageBreaks > 0 || epoch2Drift > 0) {
+      console.error(`[ForensicLedger] Recovered ${entries.length} entries from PostgreSQL — ${linkageBreaks} LINKAGE BREAK(S), ${epoch2Drift} epoch-2 content drift(s) detected and left untouched (head: ${this.headHash.substring(0, 12)}...)`);
     } else {
-      console.error(`[ForensicLedger] Recovered ${entries.length} entries from PostgreSQL (head: ${this.headHash.substring(0, 12)}...)`);
+      console.error(`[ForensicLedger] Recovered ${entries.length} entries from PostgreSQL, linkage intact (head: ${this.headHash.substring(0, 12)}...)`);
     }
     return { recovered: entries.length, persisted: true };
   }
@@ -367,16 +380,24 @@ export class ForensicLedger {
   getActiveOperations(): string[] { return Array.from(this.activeBuilders.keys()); }
 
   /**
-   * Verify the integrity of the entire hash chain.
+   * Verify the internal consistency of the in-memory hash chain.
    *
-   * Recomputes every hash from genesis and compares against stored hashes.
-   * If any link is broken, returns the index and details of the first break.
+   * Entries appended by THIS process (above recoveryBoundaryIndex) are
+   * content-verified: their hash is recomputed with this process's algorithm
+   * and compared. Entries recovered from PostgreSQL (at or below the boundary)
+   * are LINKAGE-verified only — stored previous_hash must equal the prior
+   * entry's stored entry_hash — because recovered rows may have been written
+   * by other writers whose historical preimages differ; recomputing them with
+   * this algorithm would report false tampering. Persisted-row content
+   * verification is verify_ledger_v2's job.
    *
    * Time complexity: O(n) where n = log.length
    * This is an INFORMATIONAL operation — read-only, no side effects.
    */
   verifyChain(): IChainVerificationResult {
     const startTime = Date.now();
+    const linkageOnlyPrefix = this.recoveryBoundaryIndex + 1;
+    const legacyLinkageBreaks = this.legacyBreakPositions.size;
 
     if (this.log.length === 0) {
       return {
@@ -386,6 +407,9 @@ export class ForensicLedger {
         headHash: GENESIS_HASH,
         verifiedAt: utcNow(),
         verificationDurationMs: Date.now() - startTime,
+        linkageOnlyPrefix: 0,
+        contentVerified: 0,
+        legacyLinkageBreaks: 0,
       };
     }
 
@@ -400,58 +424,65 @@ export class ForensicLedger {
         headHash: this.verifyCheckpointHash,
         verifiedAt: utcNow(),
         verificationDurationMs: Date.now() - startTime,
+        linkageOnlyPrefix,
+        contentVerified: Math.max(0, this.log.length - linkageOnlyPrefix),
+        legacyLinkageBreaks,
       };
     }
 
     let previousHash = startIndex === 0 ? GENESIS_HASH : this.verifyCheckpointHash;
+    let contentVerified = 0;
+
+    const fail = (i: number, breakDetail: string): IChainVerificationResult => {
+      this.verifyCheckpointIndex = -1;
+      this.verifyCheckpointHash = GENESIS_HASH;
+      return {
+        valid: false,
+        entriesVerified: i,
+        firstBrokenLink: i,
+        headHash: previousHash,
+        breakDetail,
+        verifiedAt: utcNow(),
+        verificationDurationMs: Date.now() - startTime,
+        linkageOnlyPrefix,
+        contentVerified,
+        legacyLinkageBreaks,
+      };
+    };
 
     for (let i = startIndex; i < this.log.length; i++) {
       const entry = this.log[i];
+      const isRecovered = i <= this.recoveryBoundaryIndex;
 
-      if (entry.chainIndex !== i) {
-        this.verifyCheckpointIndex = -1;
-        this.verifyCheckpointHash = GENESIS_HASH;
-        return {
-          valid: false,
-          entriesVerified: i,
-          firstBrokenLink: i,
-          headHash: previousHash,
-          breakDetail: `Chain index mismatch at position ${i}: expected ${i}, found ${entry.chainIndex}`,
-          verifiedAt: utcNow(),
-          verificationDurationMs: Date.now() - startTime,
-        };
-      }
-
+      // Linkage check — applies to every entry, recovered or not.
+      // A mismatch at a KNOWN legacy-break position (recorded once at
+      // recovery) is permanent immutable history: reported via
+      // legacyLinkageBreaks, never re-paged. Any OTHER mismatch is NEW.
       if (entry.previousHash !== previousHash) {
-        this.verifyCheckpointIndex = -1;
-        this.verifyCheckpointHash = GENESIS_HASH;
-        return {
-          valid: false,
-          entriesVerified: i,
-          firstBrokenLink: i,
-          headHash: previousHash,
-          breakDetail: `Previous hash mismatch at position ${i}: expected ${previousHash.substring(0, 16)}..., found ${(entry.previousHash ?? 'undefined').substring(0, 16)}...`,
-          verifiedAt: utcNow(),
-          verificationDurationMs: Date.now() - startTime,
-        };
+        if (!(isRecovered && this.legacyBreakPositions.has(i))) {
+          return fail(i, `Previous hash mismatch at position ${i}: expected ${previousHash.substring(0, 16)}..., found ${(entry.previousHash ?? 'undefined').substring(0, 16)}...`);
+        }
       }
 
-      const recomputed = computeEntryHash(previousHash, entry);
+      if (isRecovered) {
+        // Recovered row: carry the STORED hash forward — linkage-only.
+        // Recomputing another writer's historical preimage with this
+        // process's algorithm would report false tampering.
+        previousHash = entry.entryHash ?? previousHash;
+        continue;
+      }
 
+      // In-process entry: full content verification (epoch-2 algorithm).
+      if (entry.chainIndex !== i) {
+        return fail(i, `Chain index mismatch at position ${i}: expected ${i}, found ${entry.chainIndex}`);
+      }
+
+      const recomputed = computeEntryHashV2(previousHash, projectAuditEntryToV2(entry));
       if (entry.entryHash !== recomputed) {
-        this.verifyCheckpointIndex = -1;
-        this.verifyCheckpointHash = GENESIS_HASH;
-        return {
-          valid: false,
-          entriesVerified: i,
-          firstBrokenLink: i,
-          headHash: previousHash,
-          breakDetail: `Entry hash mismatch at position ${i} (id: ${entry.id}, op: ${entry.operation}): stored ${(entry.entryHash ?? 'undefined').substring(0, 16)}..., computed ${recomputed.substring(0, 16)}...`,
-          verifiedAt: utcNow(),
-          verificationDurationMs: Date.now() - startTime,
-        };
+        return fail(i, `Entry hash mismatch at position ${i} (id: ${entry.id}, op: ${entry.operation}): stored ${(entry.entryHash ?? 'undefined').substring(0, 16)}..., computed ${recomputed.substring(0, 16)}...`);
       }
 
+      contentVerified++;
       previousHash = recomputed;
     }
 
@@ -466,6 +497,9 @@ export class ForensicLedger {
       headHash: previousHash,
       verifiedAt: utcNow(),
       verificationDurationMs: Date.now() - startTime,
+      linkageOnlyPrefix,
+      contentVerified,
+      legacyLinkageBreaks,
     };
   }
 
@@ -524,10 +558,14 @@ export class ForensicLedger {
         ...entry,
         chainIndex: this.log.length,
         previousHash: this.headHash,
+        algoEpoch: CHAIN_VERSION_V2,
       };
 
-      // Step 3: Compute SHA-256 hash over (previousHash || canonical entry data)
-      const hash = computeEntryHash(this.headHash, chainedEntry);
+      // Step 3: Compute SHA-256 hash over (previousHash || canonicalV2 projection).
+      // Epoch-2 (Ledger Canonical v2): the hash attests the closed v2 skeleton
+      // (id/timestamp/operation/layer/actor/correlationId/parentId/metadata/
+      // schemaVersion); excluded fields remain content-attested DB columns.
+      const hash = computeEntryHashV2(this.headHash, projectAuditEntryToV2(chainedEntry));
       chainedEntry.entryHash = hash;
 
       // Step 4-5: Freeze and append

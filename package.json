@@ -1,7 +1,8 @@
 {
   "name": "gia-mcp-server",
-  "version": "0.3.6",
-  "description": "Runtime governance layer for generative AI agents. Works with any MCP-compatible client — Claude, GPT, Gemini, Cursor, or custom frameworks. MAI classification, forensic audit trails, human-in-the-loop gates, EU AI Act compliance, NIST/SOC 2/CMMC mapping.",
+  "version": "0.4.3",
+  "description": "Runtime governance layer for AI agents. Model-agnostic and vendor-neutral — works with any MCP-compatible client, agent, or framework. MAI decision classification, human-in-the-loop gates, hash-chained forensic audit, governed context authority, EU AI Act / NIST / SOC 2 / CMMC mapping.",
+  "homepage": "https://gia.aceadvising.com/get-api-key",
   "author": {
     "name": "William J. Storey III",
     "url": "https://aceadvising.com"
@@ -22,21 +23,20 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "anthropic",
-    "claude",
+    "ai-governance",
     "governance",
+    "agent-governance",
     "audit",
+    "forensic-ledger",
     "compliance",
+    "human-in-the-loop",
+    "ai-safety",
+    "guardrails",
+    "policy-enforcement",
+    "ai-contract",
     "nist",
     "eu-ai-act",
     "iso-42001",
-    "human-in-the-loop",
-    "ai-safety",
-    "forensic-ledger",
-    "openai",
-    "agent-builder",
-    "ai-governance",
-    "ai-contract",
     "soc2",
     "cmmc",
     "fedramp",
@@ -50,7 +50,7 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/mcp/server.ts",
     "start": "node dist/index.js",
     "start:http": "node dist/mcp/server-http.js",
@@ -60,10 +60,14 @@
     "test:integration": "vitest run tests/integration/",
     "test:smoke": "tsx tests/smoke/live-server.ts",
     "lint": "eslint src/",
-    "onboard": "tsx src/onboarding/generate-client-config.ts"
+    "onboard": "tsx src/onboarding/generate-client-config.ts",
+    "prepublishOnly": "npm run build && npm run test:release",
+    "test:release": "vitest run tests/shared/version-provenance.test.ts tests/docs/published-claims.test.ts tests/mcp/tool-classification-drift.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "ioredis": "^5.10.1",
     "pg": "^8.13.0",
     "uuid": "^14.0.0",
     "zod": "^3.22.0"
@@ -75,5 +79,9 @@
     "tsx": "^4.0.0",
     "typescript": "^5.3.0",
     "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "vite": "^7.3.5",
+    "esbuild": "^0.28.1"
   }
 }

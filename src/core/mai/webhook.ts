@@ -28,7 +28,6 @@ import { GOVERNANCE_CONFIG } from '../../config/governance.config.js';
 // This bridges the MCP gate lifecycle to the operator's phone.
 const NTFY_TOPIC = process.env.NTFY_TOPIC || '';
 const NTFY_URL = process.env.NTFY_URL || 'https://ntfy.sh';
-const GIA_BASE_URL = process.env.GIA_BASE_URL || process.env.GATE_NOTIFY_BASE_URL || 'https://165.232.145.243';
 
 /**
  * Send a push notification to ntfy.sh for MANDATORY gate events.
@@ -50,15 +49,15 @@ async function sendNtfyNotification(
       'Tags': (tags || ['rotating_light', 'lock']).join(','),
     };
 
-    // Add approve/deny action buttons if gateId provided
-    if (gateId) {
-      const approveUrl = `${GIA_BASE_URL}/api/gia/gates/${gateId}/approve`;
-      const rejectUrl = `${GIA_BASE_URL}/api/gia/gates/${gateId}/reject`;
-      headers['Actions'] = [
-        `http, Approve, ${approveUrl}, method=POST, headers.Content-Type=application/json, body={"rationale":"Approved via ntfy"}`,
-        `http, Deny, ${rejectUrl}, method=POST, headers.Content-Type=application/json, body={"rationale":"Rejected via ntfy"}`,
-      ].join('; ');
-    }
+    // NOTE: No approve/deny action buttons here. This notifier runs inside
+    // gia-mcp-server, a separate process from the main `server/` app — it has
+    // no access to server/'s in-memory single-use approval tokens
+    // (server/src/srt/gateNotifier.ts's tokenStore), and /api/gia/gates/:id/approve
+    // requires requireAuth, so an unauthenticated ntfy tap against that URL
+    // always 401s. Resolution for this gate still works: gate.ts's polling loop
+    // reads gate_approvals_persistent by gate_id (no token needed) for the
+    // operator console / board_approve_gate / operator.ts dashboard paths.
+    void gateId;
 
     const url = `${NTFY_URL}/${NTFY_TOPIC}`;
     const controller = new AbortController();

@@ -59,6 +59,28 @@ export function registerClassifyDecisionTool(server: McpServer, engine: Governan
       entry.addMetadata('decision', sanitize(input.decision).slice(0, 200));
 
       try {
+        // Circuit breaker: if any MANDATORY gate is pending, block new submissions
+        // until the ISSO resolves it. Agents must call get_gate_status(gateId) to wait.
+        const pendingGates = engine.gate.getPendingApprovals();
+        if (pendingGates.length > 0) {
+          const oldest = pendingGates[0];
+          engine.ledger.record(entry.fail(
+            new Error(`Gate hold: ${pendingGates.length} pending MANDATORY gate(s)`),
+            MaiClassification.MANDATORY
+          ));
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              classification: 'MANDATORY',
+              requiresGate: true,
+              gateStatus: 'HOLD',
+              gateId: oldest.gateId,
+              gateInstruction: `GATE HOLD: ${pendingGates.length} MANDATORY gate(s) await ISSO approval. Call get_gate_status("${oldest.gateId}") to wait for resolution. Do NOT submit new decisions until resolved.`,
+              auditId: entry.id,
+            }, null, 2) }],
+            isError: true,
+          };
+        }
+
         const sanitizedDecision = sanitize(input.decision);
         const context: IClassificationContext = {
           operation: sanitizedDecision,

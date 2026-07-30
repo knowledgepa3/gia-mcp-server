@@ -20,6 +20,7 @@
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { GovernanceEngine } from '../../core/governance.js';
 import { MaiClassification, GiaLayer } from '../../shared/types.js';
@@ -30,6 +31,11 @@ import {
   getCerebroStats,
 } from '../../core/persistence/intelligence-persistence.js';
 
+/** Real SHA-256 digest over a snapshot's captured state (replaces the old hex-timestamp placeholder). */
+export function computeSnapshotStateHash(state: unknown): string {
+  return createHash('sha256').update(JSON.stringify(state)).digest('hex');
+}
+
 export function registerPhoenixRecoveryTools(server: McpServer, engine: GovernanceEngine): void {
 
   // =========================================================================
@@ -37,7 +43,7 @@ export function registerPhoenixRecoveryTools(server: McpServer, engine: Governan
   // =========================================================================
   server.tool(
     'phoenix_snapshot',
-    'Create a governed state snapshot capturing the current platform operational state. Records ledger chain head, active gates, contracts, budgets, MAI state, intelligence counts, and memory packs. Each snapshot is SHA-256 hashed and chained to the previous snapshot for tamper evidence. Classification: INFORMATIONAL — read-only capture, no mutations.',
+    'Create a governed state snapshot capturing the current platform operational state. Records ledger chain head, active gates, contracts, budgets, MAI state, intelligence counts, and memory packs. Each snapshot is SHA-256 hashed over its captured state for integrity (snapshot-to-snapshot chaining is not yet persisted). Classification: INFORMATIONAL — read-only capture, no mutations.',
     {
       trigger_type: z.enum(['manual', 'scheduled']).optional().describe('What triggered this snapshot (default: manual)'),
       notes: z.string().optional().describe('Optional operator notes for this checkpoint'),
@@ -96,8 +102,9 @@ export function registerPhoenixRecoveryTools(server: McpServer, engine: Governan
         },
 
         integrity: {
-          stateHash: `SHA256:${Date.now().toString(16)}`, // Placeholder for real hash
-          previousSnapshot: null, // Would chain to previous
+          stateHash: '',            // real SHA-256 over the captured state, set just below
+          hashAlgorithm: 'SHA-256',
+          previousSnapshot: null,   // snapshot-to-snapshot chaining not yet persisted
         },
 
         compliance: {
@@ -105,6 +112,11 @@ export function registerPhoenixRecoveryTools(server: McpServer, engine: Governan
           'NIST-CP-9': 'CHECKPOINT_RECORDED',
         },
       };
+
+      // Real SHA-256 over the captured state (everything except the integrity block itself,
+      // which holds the hash). Replaces the prior hex-timestamp placeholder.
+      const { integrity: _integrity, ...snapshotContent } = snapshot;
+      snapshot.integrity.stateHash = computeSnapshotStateHash(snapshotContent);
 
       // Tool accountability tracking
       engine.telemetryService.emitToolCall('phoenix_snapshot', snapshot.snapshotId, 'INFORMATIONAL', true);
@@ -218,10 +230,16 @@ export function registerPhoenixRecoveryTools(server: McpServer, engine: Governan
           ? 'Recommend creating a recovery snapshot and investigating degraded components'
           : 'IMMEDIATE ACTION — system integrity compromised. Initiate Phoenix recovery protocol.',
 
+        // Conditional on real runtime state — NOT an audited/certified NIST
+        // attestation (see attestationBasis). Mirrors the honest pattern already
+        // used in server/src/routes/phoenixRecovery.ts. CP-2 (Contingency Plan)
+        // tracks whether the recovery capability is actually available; CP-10
+        // (Recovery/Reconstitution) is a live integrity check on the ledger chain.
         compliance: {
-          'NIST-CP-2': 'VERIFIED',
-          'NIST-CP-10': 'INTEGRITY_CHECKED',
+          'NIST-CP-2': phoenixAvailable ? 'COMPLIANT' : 'NOT_CONFIGURED',
+          'NIST-CP-10': chainResult.valid ? 'INTEGRITY_VERIFIED' : 'INTEGRITY_FAILED',
           'EU-AI-ACT-Art15': integrityScore >= 75 ? 'OPERATIONAL_RESILIENCE_MAINTAINED' : 'RESILIENCE_DEGRADED',
+          attestationBasis: 'HEURISTIC_SELF_CHECK',
         },
       };
 

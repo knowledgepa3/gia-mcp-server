@@ -17,6 +17,27 @@ export interface IClassificationRequest {
   piiDetected: boolean;
 }
 
+/** Claim status carried by an external evidence provider (e.g. MIR). */
+export type ExternalEvidenceClaimStatus = 'clean' | 'flagged' | 'contested';
+/** Recommendation carried by an external evidence provider. GIA decides; this never does. */
+export type ExternalEvidenceRecommendation = 'ALLOW' | 'STEP_UP' | 'LIMIT' | 'DENY';
+
+/**
+ * External participation-history evidence attached to a classification context
+ * (MIR seam, authorized 2026-07-02). EVIDENCE, NOT AUTHORITY: this is one input
+ * to the deterministic elevation rules below — the classifier/gate decides.
+ * Absence of this field is fail-safe: no evidence, no elevation change.
+ * Must be stamped by core/evidence/applyExternalEvidence from a provider fetch —
+ * NEVER accepted as caller/tool input (caller-asserted evidence would be a
+ * self-attestation hole).
+ */
+export interface IExternalEvidenceContext {
+  provider: string;
+  claimStatus: ExternalEvidenceClaimStatus;
+  recommendation: ExternalEvidenceRecommendation;
+  tier?: number;
+}
+
 export interface IClassificationContext {
   operation: string;
   agentName?: string;
@@ -28,6 +49,8 @@ export interface IClassificationContext {
   piiDetected: boolean;
   /** Cross-ledger correlation ID — links MCP governance decisions to server-side HTTP request chains. */
   correlationId?: string;
+  /** External participation-history evidence (MIR seam). Optional; absence = no effect. */
+  externalEvidence?: IExternalEvidenceContext;
 }
 
 export const MAI_PRIORITY: Record<MaiClassification, number> = {
@@ -46,4 +69,12 @@ export const DEFAULT_ELEVATION_RULES: IMaiElevationRule[] = [
   { condition: 'legal_assertion_external',  elevateTo: MaiClassification.MANDATORY, description: 'Legal assertion to external party requires MANDATORY review' },
   { condition: 'legal_assertion_internal',  elevateTo: MaiClassification.ADVISORY,  description: 'Legal analysis (internal) elevates to ADVISORY minimum' },
   { condition: 'medical_language',          elevateTo: MaiClassification.ADVISORY,  description: 'Medical language elevates to ADVISORY minimum' },
+  // External-evidence rules (MIR seam, 2026-07-02). Deterministic mapping agreed at the
+  // GIA+MIR boundary: the provider recommends, GIA's gate decides. Elevate-only (Rule 2):
+  // ALLOW/clean never reduces a classification.
+  { condition: 'external_evidence_deny',      elevateTo: MaiClassification.MANDATORY, description: 'External evidence DENY — block until human decision' },
+  { condition: 'external_evidence_contested', elevateTo: MaiClassification.MANDATORY, description: 'External evidence claim CONTESTED — human review required' },
+  { condition: 'external_evidence_step_up',   elevateTo: MaiClassification.MANDATORY, description: 'External evidence STEP_UP — human approval required' },
+  { condition: 'external_evidence_limit',     elevateTo: MaiClassification.ADVISORY,  description: 'External evidence LIMIT — flagged for oversight, proceeds' },
+  { condition: 'external_evidence_flagged',   elevateTo: MaiClassification.ADVISORY,  description: 'External evidence claim FLAGGED — flagged for oversight, proceeds' },
 ];

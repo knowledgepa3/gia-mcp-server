@@ -109,6 +109,13 @@ export class MaiClassifier {
       case 'legal_assertion_internal': return context.hasLegalImpact && !isExternal;
       case 'medical_language':         return context.inputSensitivity === 'SOVEREIGN';
       case 'cue_identified':           return (context as unknown as Record<string, unknown>)['cueIdentified'] === true;
+      // External-evidence conditions (MIR seam) — read the typed context field only;
+      // absent field = false on every condition (fail-safe: absence of history ≠ risk).
+      case 'external_evidence_deny':      return context.externalEvidence?.recommendation === 'DENY';
+      case 'external_evidence_step_up':   return context.externalEvidence?.recommendation === 'STEP_UP';
+      case 'external_evidence_contested': return context.externalEvidence?.claimStatus === 'contested';
+      case 'external_evidence_limit':     return context.externalEvidence?.recommendation === 'LIMIT';
+      case 'external_evidence_flagged':   return context.externalEvidence?.claimStatus === 'flagged';
       default: return false;
     }
   }

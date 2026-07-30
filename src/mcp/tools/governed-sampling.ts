@@ -93,10 +93,21 @@ export function registerGovernedSamplingTool(server: McpServer, engine: Governan
               rationale: result.classification.rationale,
               gateEnforced: !!result.gateDecision,
               gateStatus: result.gateDecision?.status,
-              compositeScore: result.score.composite,
-              integrity: result.score.integrity,
-              accuracy: result.score.accuracy,
-              compliance: result.score.compliance,
+              scored: result.score.scored,
+              // Sampling never independently measures the model's output, so the
+              // score is an explicit NOT-SCORED sentinel — surface that honestly
+              // rather than dumping the -1 sentinel as if it were a real number.
+              ...(result.score.scored
+                ? {
+                    compositeScore: result.score.composite,
+                    integrity: result.score.integrity,
+                    accuracy: result.score.accuracy,
+                    compliance: result.score.compliance,
+                  }
+                : {
+                    scoreBasis:
+                      'NOT independently scored — model output is not measured for accuracy. Transport integrity is attested out-of-band via contentHash.',
+                  }),
             },
           }, null, 2) }],
         };

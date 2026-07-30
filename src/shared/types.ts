@@ -87,6 +87,13 @@ export interface IGovernanceScore {
   weights: IScoreWeights;
   timestamp: Date;
   scoredBy: string;
+  /**
+   * True when integrity/accuracy/compliance were actually measured. False for
+   * scoreDefault() not-scored sentinels (control-plane ops with nothing to
+   * measure). Consumers MUST NOT treat a `scored === false` entry as a passing
+   * measurement. Optional for backward compatibility (treat absent as scored).
+   */
+  scored?: boolean;
 }
 
 export interface IScoreWeights {
@@ -151,6 +158,10 @@ export interface IAuditEntry {
   previousHash?: string;
   /** Index position in the append-only ledger at time of hashing. */
   chainIndex?: number;
+  /** Canonicalization epoch of entryHash: 1 = heterogeneous legacy bucket
+   * (linkage-only verifiable), 2 = Ledger Canonical v2 (content-verifiable).
+   * Populated on recovery from the algo_epoch column; stamped 2 on new writes. */
+  algoEpoch?: number;
 }
 
 export interface IGovernedResult<T> {
@@ -216,6 +227,10 @@ export interface IComplianceMapping {
   control: string;
   description: string;
   giaComponent: string;
+  // DESIGN-MAPPING status — whether a GIA component is mapped to the control.
+  // 'IMPLEMENTED' = the component exists and is mapped; it does NOT assert third-party
+  // certification or measured runtime enforcement. Runtime-evidenced coverage is a
+  // separate axis (ControlBinding, post-QA-B) — see map-compliance.ts MAPPING_DISCLAIMER.
   status: 'IMPLEMENTED' | 'PARTIAL' | 'PLANNED';
 }
 

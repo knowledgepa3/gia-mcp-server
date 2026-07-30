@@ -19,6 +19,8 @@
  */
 
 import type { IAuditEntry } from '../../shared/types.js';
+import { computeEntryHashV2, toCanonicalTimestamp, CHAIN_VERSION_V2 } from './canonicalV2.js';
+import { projectAuditEntryToV2 } from './projectToV2.js';
 
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
@@ -48,11 +50,9 @@ export async function initLedgerPersistence(): Promise<boolean> {
     const { Pool } = await import('pg');
     pool = new Pool({
       connectionString: databaseUrl,
-      // Bumped from 5 → 20 to absorb the recovery hash-sync burst.
-      // updateEntryHashes() is called fire-and-forget for every drifted
-      // entry on startup; with 2000+ entries and a small pool, the burst
-      // saturated the pool and caused cascading timeouts that blocked
-      // builder board sessions and memory pack loads.
+      // Sized at 20 for concurrent readers/writers. (Historically bumped from
+      // 5 to absorb the recovery hash-sync UPDATE burst; that write path was
+      // permanently removed 2026-07-01 — recovery is read-only now.)
       max: 20,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 10000,
@@ -61,10 +61,15 @@ export async function initLedgerPersistence(): Promise<boolean> {
     // Verify connection
     const client = await pool.connect();
     // Ensure table exists (idempotent)
+    // PRIMARY KEY is (chain_index), NOT (id): the ledger records every state
+    // transition (STARTED, then COMPLETED/FAILED) as a SEPARATE row sharing the
+    // audit id, so id is intentionally NON-UNIQUE (F-5, migration 155). Making
+    // id the PK silently dropped one transition per audit. chain_index is the
+    // natural key (globally unique, monotonic). Fresh/DR deploys must match m155.
     await client.query(`
       CREATE TABLE IF NOT EXISTS forensic_ledger (
-        id              TEXT        PRIMARY KEY,
-        chain_index     INTEGER     NOT NULL UNIQUE,
+        id              TEXT        NOT NULL,
+        chain_index     INTEGER     NOT NULL PRIMARY KEY,
         timestamp       TIMESTAMPTZ NOT NULL,
         operation       TEXT        NOT NULL,
         layer           TEXT        NOT NULL DEFAULT 'CORE',
@@ -81,16 +86,50 @@ export async function initLedgerPersistence(): Promise<boolean> {
         error_message    TEXT,
         entry_hash       TEXT        NOT NULL UNIQUE,
         previous_hash    TEXT        NOT NULL,
+        source_instance  TEXT,
+        delegated_by     TEXT,
+        tenant_id        TEXT        NOT NULL DEFAULT 'default',
+        actor_tenant_id  TEXT,
+        algo_epoch       INTEGER     NOT NULL DEFAULT 1,
         created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
-    // Add columns to existing tables (safe for upgrades)
+    // Add columns to existing tables (safe for upgrades).
+    // NOTE (R-9): the table is declared in THREE places — server migrations
+    // (026 base, 052 delegated_by/actor_tenant_id, 110 tenant_id, 154 algo_epoch),
+    // this inline CREATE, and this ALTER list. Any new column MUST be added to
+    // all three or a fresh/DR deploy that bootstraps the table here will reject
+    // every INSERT naming the column.
+    //
+    // 2026-07-18 live-fire finding: delegated_by/tenant_id/actor_tenant_id were
+    // in the real INSERT (below) and in migrations 052/110, but NOT here — a
+    // fresh/DR bootstrap using this fallback silently dropped every single
+    // forensic_ledger write (fire-and-forget catch, never surfaced to the
+    // caller). Confirmed live on a throwaway Postgres: zero rows persisted
+    // across a full test run. Production was never affected — its schema came
+    // from the real migration chain, which already had all three columns.
     await client.query(`
       ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS correlation_id TEXT
     `).catch(() => { /* column already exists */ });
     await client.query(`
       ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS source_instance TEXT
     `).catch(() => { /* column already exists */ });
+    await client.query(`
+      ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS delegated_by TEXT
+    `).catch(() => { /* column already exists */ });
+    await client.query(`
+      ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'
+    `).catch(() => { /* column already exists */ });
+    await client.query(`
+      ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS actor_tenant_id TEXT
+    `).catch(() => { /* column already exists */ });
+    await client.query(`
+      ALTER TABLE forensic_ledger ADD COLUMN IF NOT EXISTS algo_epoch INTEGER NOT NULL DEFAULT 1
+    `).catch(() => { /* column already exists */ });
+    // Fast lookup by audit id now that id is non-unique (state-transition history).
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_forensic_ledger_id ON forensic_ledger(id)
+    `).catch(() => { /* index already exists */ });
     client.release();
 
     poolInitialized = true;
@@ -110,23 +149,10 @@ export async function initLedgerPersistence(): Promise<boolean> {
  */
 const CHAIN_LOCK_ID = 777_888_999;
 
-/**
- * Recompute SHA-256 hash matching the in-memory ledger's algorithm.
- * Hash = SHA-256(previousHash || '||' || canonical JSON of entry fields).
- */
-async function recomputeHash(previousHash: string, entry: IAuditEntry): Promise<string> {
-  const { createHash } = await import('crypto');
-  // Canonical: sorted keys, Dates as ISO strings, skip hash/chain fields
-  const canonical: Record<string, unknown> = {};
-  const sortedKeys = Object.keys(entry).sort();
-  for (const key of sortedKeys) {
-    if (key === 'entryHash' || key === 'previousHash' || key === 'chainIndex') continue;
-    const val = (entry as any)[key];
-    canonical[key] = val instanceof Date ? val.toISOString() : val;
-  }
-  const preimage = previousHash + '||' + JSON.stringify(canonical);
-  return createHash('sha256').update(preimage).digest('hex');
-}
+// Epoch-2 hashing happens inline in persistEntry via projectAuditEntryToV2 +
+// computeEntryHashV2 (Ledger Canonical v2, 2026-07-01). The projected v2
+// metadata is BOTH hashed and inserted — hash-form and persisted-form cannot
+// diverge (closure rule, projectToV2.ts).
 
 /**
  * Persist a single ledger entry to PostgreSQL with serialized chain linking.
@@ -144,18 +170,63 @@ async function recomputeHash(previousHash: string, entry: IAuditEntry): Promise<
  *
  * Fire-and-forget from caller's perspective: errors are logged, never thrown.
  */
+/**
+ * In-flight persist promises. persistEntry is fire-and-forget (returns void so
+ * it never blocks the in-memory ledger), but a short-lived process that exits
+ * before these settle DROPS the queued writes — which is how two-phase
+ * begin→record flows lost their outcome rows in short invocations (F-5,
+ * 2026-07-01). drainPendingWrites() awaits this set so shutdown paths can flush
+ * before exit. Bounded by natural write throughput; entries self-remove on settle.
+ */
+const pendingWrites: Set<Promise<void>> = new Set();
+
+/** Number of writes still in flight (for diagnostics/tests). */
+export function pendingWriteCount(): number {
+  return pendingWrites.size;
+}
+
+/**
+ * Await all in-flight persist writes. Call before process exit so fire-and-forget
+ * ledger writes are not lost. Resolves even if individual writes rejected (they
+ * log their own errors). Safe to call repeatedly.
+ */
+export async function drainPendingWrites(): Promise<void> {
+  // Snapshot: awaiting may let new writes enqueue; loop until quiescent (bounded
+  // — nothing enqueues new writes during shutdown once inputs are closed).
+  let guard = 0;
+  while (pendingWrites.size > 0 && guard < 100) {
+    await Promise.allSettled([...pendingWrites]);
+    guard++;
+  }
+}
+
 export function persistEntry(entry: IAuditEntry): void {
   if (!persistenceEnabled || !pool) return;
 
-  const timestamp = entry.timestamp instanceof Date
-    ? entry.timestamp.toISOString()
-    : String(entry.timestamp);
+  // Field-to-column closure: the timestamp COLUMN gets exactly the canonical
+  // ISO form the hash attests, so verify-time reconstruction is byte-stable.
+  const timestamp = toCanonicalTimestamp(entry.timestamp);
 
-  // Serialized write — ensures strict linear chain
-  (async () => {
+  // Serialized write — ensures strict linear chain. Tracked in pendingWrites so
+  // drainPendingWrites() can flush before a process exits (F-5).
+  const writePromise = (async () => {
     const client = await pool.connect();
+    // Hoisted so the 23505 discriminator in catch can report which
+    // chain_index the failed INSERT attempted.
+    let attemptedChainIndex: number | null = null;
     try {
       await client.query('BEGIN');
+
+      // PLATFORM CONTEXT PIN — required because the chain-head read below must
+      // see the GLOBAL chain head under FORCE RLS. The tenant_isolation policy
+      // passes when current_setting('app.current_tenant_id', true) = '' (system
+      // context); if this connection inherited a tenant-scoped GUC, the head
+      // SELECT would return a tenant-filtered (stale) head, the INSERT would
+      // collide on UNIQUE(chain_index) with 23505, and the entry would be
+      // silently lost (incident 2026-06-12; mirrors server withTransactionPlatform).
+      // SET LOCAL scopes the pin to this transaction only — tenant ATTRIBUTION
+      // on the inserted row (tenant_id/actor_tenant_id params) is unchanged.
+      await client.query(`SET LOCAL app.current_tenant_id = ''`);
 
       // Step 2: Acquire advisory lock — serializes ALL chain writers
       await client.query('SELECT pg_advisory_xact_lock($1)', [CHAIN_LOCK_ID]);
@@ -170,14 +241,29 @@ export function persistEntry(entry: IAuditEntry): void {
       const dbNextIndex = headResult.rows.length > 0
         ? headResult.rows[0].chain_index + 1
         : 0;
+      attemptedChainIndex = dbNextIndex;
 
-      // Step 4: Recompute hash using DB's chain head for strict linear linking
-      const correctedEntry: IAuditEntry = {
-        ...entry,
-        chainIndex: dbNextIndex,
-        previousHash: dbPrevHash,
-      };
-      const correctedHash = await recomputeHash(dbPrevHash, correctedEntry);
+      // Step 4: Recompute hash using DB's chain head for strict linear linking.
+      // Epoch-2 (Ledger Canonical v2): hash the closed v2 projection. The
+      // projected metadata is inserted below via JSON.stringify of the SAME
+      // object, so the persisted JSONB always equals the hashed form.
+      const v2Source = projectAuditEntryToV2(entry);
+      const correctedHash = computeEntryHashV2(dbPrevHash, v2Source);
+
+      // Tenant isolation columns. tenant_id is the CANONICAL isolation column
+      // (RLS m111 keys on it); actor_tenant_id is provenance only. This writer
+      // uses a raw pool.connect() with no GUC set, so the m114 autofill trigger
+      // does not fire and tenant_id would otherwise silently fall to its DEFAULT
+      // 'default' while actor_tenant_id stayed NULL — divergent and inconsistent.
+      // The in-memory ForensicLedger / IAuditEntry carries no tenant identity in
+      // this MCP context (no tenant is threaded down to the ledger entry), so we
+      // set BOTH columns explicitly to the same value: the acting agent's tenant
+      // if one is ever present on the entry's metadata, otherwise 'default'.
+      // Setting both consistently is the whole point — they must never diverge.
+      const entryTenant =
+        (typeof (entry.metadata as Record<string, unknown> | undefined)?.tenantId === 'string'
+          ? ((entry.metadata as Record<string, unknown>).tenantId as string)
+          : null) || 'default';
 
       // Step 5: INSERT with correct linear chain linkage
       await client.query(
@@ -185,12 +271,13 @@ export function persistEntry(entry: IAuditEntry): void {
           id, chain_index, timestamp, operation, layer, mai_level,
           actor, status, parent_id, correlation_id, governance_score, gate_decision,
           metadata, duration, error_code, error_message,
-          entry_hash, previous_hash, source_instance, delegated_by
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+          entry_hash, previous_hash, source_instance, delegated_by,
+          tenant_id, actor_tenant_id, algo_epoch
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
         [
           entry.id,
           dbNextIndex,
-          timestamp,
+          timestamp, // canonical ISO (see above) — identical to the hashed form
           entry.operation,
           entry.layer,
           entry.maiLevel,
@@ -200,7 +287,8 @@ export function persistEntry(entry: IAuditEntry): void {
           entry.correlationId ?? null,
           entry.governanceScore ? JSON.stringify(entry.governanceScore) : null,
           entry.gateDecision ? JSON.stringify(entry.gateDecision) : null,
-          JSON.stringify(entry.metadata ?? {}),
+          // CLOSURE RULE: insert the SAME sanitized object that was hashed.
+          JSON.stringify(v2Source.metadata ?? {}),
           entry.duration ?? null,
           entry.errorCode ?? null,
           entry.errorMessage ?? null,
@@ -208,6 +296,9 @@ export function persistEntry(entry: IAuditEntry): void {
           dbPrevHash,
           SOURCE_INSTANCE,
           entry.delegatedBy ?? null,
+          entryTenant, // tenant_id — canonical isolation column
+          entryTenant, // actor_tenant_id — kept consistent with tenant_id (never NULL while tenant_id='default')
+          CHAIN_VERSION_V2, // algo_epoch = 2 — Ledger Canonical v2 row
         ]
       );
 
@@ -215,8 +306,28 @@ export function persistEntry(entry: IAuditEntry): void {
       await client.query('COMMIT');
     } catch (err: any) {
       await client.query('ROLLBACK').catch(() => {}); // qa:ignore — ROLLBACK after error: connection released in finally
-      // 23505 = unique_violation — entry already persisted, safe to ignore
-      if (err.code === '23505') return;
+      // 23505 = unique_violation — DISCRIMINATE by constraint.
+      //
+      // ⚠ POST-migration-155 (F-5): the PRIMARY KEY is now (chain_index), NOT id.
+      // `id` is intentionally NON-UNIQUE — every state transition (STARTED then
+      // COMPLETED/FAILED) is its own row sharing the audit id. So an id "dup" is
+      // no longer a constraint violation at all; that was the bug that silently
+      // swallowed one transition per audit.
+      // Benign ⇔ a TRUE content duplicate: same entry_hash (idempotent re-append
+      // of the identical entry). Everything else — including a collision on the
+      // chain_index PK (now named forensic_ledger_pkey) — is the SILENT-LOSS
+      // class (stale head under RLS, incident 2026-06-12): never swallow.
+      if (err.code === '23505') {
+        const constraint: string | undefined = err.constraint;
+        const isBenignDupe =
+          typeof constraint === 'string' && constraint.includes('entry_hash');
+        if (isBenignDupe) return;
+        console.error(
+          `[Ledger-Persist] CHAIN-INDEX COLLISION — entry NOT persisted (silent-loss class): operation=${entry.operation} status=${entry.status} attempted chain_index=${attemptedChainIndex ?? 'unknown'} constraint=${constraint ?? 'unknown'}:`,
+          err.message
+        );
+        return;
+      }
       console.error('[Ledger-Persist] Serialized write failed:', err.message);
     } finally {
       client.release();
@@ -224,6 +335,10 @@ export function persistEntry(entry: IAuditEntry): void {
   })().catch((err: any) => {
     console.error('[Ledger-Persist] Connection failed:', err.message);
   });
+
+  // Track the write so shutdown can drain it; self-remove on settle (F-5).
+  pendingWrites.add(writePromise);
+  void writePromise.finally(() => pendingWrites.delete(writePromise));
 }
 
 /**
@@ -257,6 +372,7 @@ export async function recoverEntries(): Promise<IAuditEntry[]> {
       entryHash: row.entry_hash,
       previousHash: row.previous_hash,
       chainIndex: row.chain_index,
+      algoEpoch: row.algo_epoch ?? 1,
     }));
   } catch (err) {
     console.error('[Ledger-Persist] Recovery failed:', (err as Error).message);
@@ -294,33 +410,26 @@ export async function exportLedgerJSON(): Promise<object[]> {
 }
 
 /**
- * Update entry_hash and previous_hash for a given chain_index.
- * Used after recovery recomputes hashes to keep DB in sync with in-memory chain.
- * Fire-and-forget from the caller's perspective — errors are logged but never block.
+ * PERMANENTLY DISABLED (2026-07-01) — logging no-op, kept only so any future
+ * caller is loudly visible in logs instead of silently rewriting the ledger.
  *
- * Internally serialized via a drain queue so a recovery burst of N entries
- * does not saturate the pool. Without this, a startup with thousands of
- * drifted hashes would queue thousands of pool.query() calls, exhaust the
- * pool, and cascade timeouts into other Ledger-Persist callers (board
- * sessions, memory pack loads, etc.).
+ * This function used to issue
+ *   UPDATE forensic_ledger SET entry_hash=$1, previous_hash=$2 WHERE chain_index=$3
+ * on every "drifted" row found during startup recovery. Because the ledger is
+ * written by multiple writers with historically different hash preimages,
+ * every non-MCP row "drifted" on every restart — so this rewrote other
+ * writers' rows, and would have laundered a genuine tamper by recomputing
+ * over the edited body and destroying the original hash (the only evidence).
+ * See docs/STATE-OF-THE-LEDGER-VERIFIED-2026-06-30.md finding F-2 (HIGH).
+ *
+ * The forensic ledger is immutable: no UPDATE forensic_ledger. Ever.
+ * Do NOT reintroduce a write path here — recovery is read-only by design.
  */
-let hashUpdateQueue: Promise<void> = Promise.resolve();
-
-export function updateEntryHashes(chainIndex: number, entryHash: string, previousHash: string): void {
-  if (!persistenceEnabled || !pool) return;
-  // Chain to the previous queue entry — serializes execution without
-  // blocking the caller. Each enqueued operation runs after the prior one
-  // resolves, so at most one hash-sync UPDATE is in flight at a time.
-  hashUpdateQueue = hashUpdateQueue
-    .then(() =>
-      pool.query(
-        `UPDATE forensic_ledger SET entry_hash = $1, previous_hash = $2 WHERE chain_index = $3`,
-        [entryHash, previousHash, chainIndex]
-      ).then(() => undefined)
-    )
-    .catch((err: any) => {
-      console.error('[Ledger-Persist] Hash update failed at chain_index', chainIndex, ':', err.message);
-    });
+export function updateEntryHashes(chainIndex: number, _entryHash: string, _previousHash: string): void {
+  console.error(
+    `[Ledger-Persist] BLOCKED: updateEntryHashes(chain_index=${chainIndex}) called — ` +
+    'ledger UPDATEs are permanently disabled (read-only recovery, F-2). No write was performed.'
+  );
 }
 
 /**
@@ -335,6 +444,9 @@ export function isPersistenceEnabled(): boolean {
  * Called during server shutdown to avoid connection leaks.
  */
 export async function closeLedgerPersistence(): Promise<void> {
+  // Flush in-flight fire-and-forget writes BEFORE tearing down the pool, so a
+  // graceful shutdown never drops a queued ledger entry (F-5).
+  await drainPendingWrites();
   if (pool) {
     try {
       await pool.end();

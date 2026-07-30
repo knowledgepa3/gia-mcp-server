@@ -17,9 +17,24 @@
  * - Idempotent: duplicate key errors silenced
  */
 
+import { bootNotice } from '../../shared/bootNotice.js';
+
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
 let persistenceEnabled = false;
+
+/**
+ * Tenant attribution for gmp_usage_log AND governed_memory_packs writes.
+ * gia-mcp is platform infrastructure with no per-request tenant identity
+ * (same surface shape as telemetry-persistence governance_events) — both
+ * stamp the platform tenant. Usage log: INSERT omitted tenant_id before
+ * 2026-06-12 (migration 136 backfilled). Packs: same fix landed with
+ * migration 139 (trust-level RLS — SYSTEM packs read globally, ORG/CASE
+ * tenant-scoped). recoverPacks/recoverUsageLog stay platform ops: this pool
+ * runs as the superuser DATABASE_URL role, which bypasses RLS — intentional,
+ * recovery must rebuild the full in-memory Map.
+ */
+const PLATFORM_TENANT_ID = process.env.PLATFORM_PRIMARY_TENANT_ID || 'default';
 
 /**
  * Initialize the PostgreSQL connection pool for GMP persistence.
@@ -27,7 +42,7 @@ let persistenceEnabled = false;
 export async function initGMPPersistence(): Promise<boolean> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('[GMP-Persist] No DATABASE_URL — running in-memory only');
+    bootNotice('[GMP-Persist] No DATABASE_URL — running in-memory only');
     return false;
   }
 
@@ -61,7 +76,8 @@ export async function initGMPPersistence(): Promise<boolean> {
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           last_reviewed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           expires_at TIMESTAMPTZ NOT NULL, usage_count INTEGER NOT NULL DEFAULT 0,
-          last_used_by VARCHAR(255)
+          last_used_by VARCHAR(255),
+          tenant_id TEXT NOT NULL DEFAULT 'default'
         )
       `);
       await client.query(`
@@ -69,7 +85,8 @@ export async function initGMPPersistence(): Promise<boolean> {
           id BIGSERIAL PRIMARY KEY, event VARCHAR(50) NOT NULL,
           memory_pack_id TEXT NOT NULL, agent_id VARCHAR(255) NOT NULL,
           run_id VARCHAR(255) NOT NULL, hash VARCHAR(16) NOT NULL,
-          approved_by VARCHAR(255), timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          approved_by VARCHAR(255), timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          tenant_id TEXT NOT NULL DEFAULT 'default'
         )
       `);
     }
@@ -95,8 +112,8 @@ export function persistPack(pack: any): void {
       memory_pack_id, version, type, trust_level, domain, scope,
       risk_level, ttl_hours, created_by, signed_by, hash, status,
       policy, content, created_at, last_reviewed_at, expires_at,
-      usage_count, last_used_by
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+      usage_count, last_used_by, tenant_id
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
     ON CONFLICT (memory_pack_id) DO UPDATE SET
       status = EXCLUDED.status,
       usage_count = EXCLUDED.usage_count,
@@ -124,6 +141,7 @@ export function persistPack(pack: any): void {
       pack.audit?.expiresAt || new Date(Date.now() + 720 * 3600000).toISOString(),
       pack.audit?.usageCount || 0,
       pack.audit?.lastUsedBy || null,
+      PLATFORM_TENANT_ID,
     ]
   ).catch((err: any) => {
     if (err.code === '23505') return; // duplicate, safe to ignore
@@ -138,8 +156,8 @@ export function persistUsageEvent(event: any): void {
   if (!persistenceEnabled || !pool) return;
 
   pool.query(
-    `INSERT INTO gmp_usage_log (event, memory_pack_id, agent_id, run_id, hash, approved_by, timestamp)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    `INSERT INTO gmp_usage_log (event, memory_pack_id, agent_id, run_id, hash, approved_by, timestamp, tenant_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       event.event,
       event.memoryPackId,
@@ -148,6 +166,7 @@ export function persistUsageEvent(event: any): void {
       event.hash,
       event.approvedBy || null,
       event.timestamp || new Date().toISOString(),
+      PLATFORM_TENANT_ID,
     ]
   ).catch((err: any) => {
     console.error('[GMP-Persist] Usage log write failed:', err.message);

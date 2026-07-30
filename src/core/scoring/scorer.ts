@@ -11,7 +11,7 @@ import {
   type IGovernanceScore, type IScoreWeights,
 } from '../../shared/types.js';
 import {
-  DEFAULT_SCORE_WEIGHTS, MIN_COMPOSITE_SCORE, SCORE_HALT_THRESHOLD,
+  DEFAULT_SCORE_WEIGHTS, MIN_COMPOSITE_SCORE, SCORE_HALT_THRESHOLD, NOT_SCORED_SENTINEL,
 } from '../../shared/constants.js';
 import { ScoreFailureError } from '../../shared/errors.js';
 import { utcNow } from '../../shared/utils.js';
@@ -61,6 +61,7 @@ export class GovernanceScorer {
       weights: { ...this.weights },
       timestamp: utcNow(),
       scoredBy: 'governance-scorer',
+      scored: true,
     };
 
     // Score below halt threshold is a MANDATORY error — pipeline stops
@@ -72,18 +73,29 @@ export class GovernanceScorer {
   }
 
   /**
-   * Score with default criteria (for operations that don't have specific scoring).
-   * Applies a baseline score that passes threshold.
+   * Record a NOT-SCORED result for control-plane operations that have no
+   * integrity/accuracy/compliance to measure (server start, gate approve/reject,
+   * snapshot, etc.).
+   *
+   * This intentionally does NOT fabricate a passing score. A prior version wrote a
+   * hardcoded 0.85 composite that masqueraded as a real measurement in the forensic
+   * ledger and always cleared the 0.70 release gate by construction (H1, simulation
+   * audit 2026-06-16). Instead it emits an explicit out-of-band sentinel with
+   * `scored: false`; consumers must treat it as "not measured", never as a pass.
+   *
+   * @param operation  the operation name (kept for caller API compatibility / audit context)
    */
   scoreDefault(operation: string): IGovernanceScore {
+    void operation;
     return {
-      integrity: 0.85,
-      accuracy: 0.85,
-      compliance: 0.85,
-      composite: 0.85,
+      integrity: NOT_SCORED_SENTINEL,
+      accuracy: NOT_SCORED_SENTINEL,
+      compliance: NOT_SCORED_SENTINEL,
+      composite: NOT_SCORED_SENTINEL,
       weights: { ...this.weights },
       timestamp: utcNow(),
-      scoredBy: 'governance-scorer-default',
+      scoredBy: 'governance-scorer-not-scored',
+      scored: false,
     };
   }
 

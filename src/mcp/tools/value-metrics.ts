@@ -8,8 +8,17 @@
  *
  * Value Metrics MCP Tools
  *
- * Turns GIA's audit exhaust into enterprise-ready proof:
- * "22 hours saved, $4,300 cost avoided, 9 unsafe actions blocked, 0 incidents shipped"
+ * Turns GIA's audit exhaust into an illustrative ROI ESTIMATE:
+ * "~22 hours saved, ~$4,300 cost avoided, 9 unsafe actions blocked, 0 incidents shipped"
+ *
+ * TRUTH-IN-LABELING (M8): These figures are ESTIMATES, not measured proof. They are
+ * computed from caller-supplied counts (record_value_metric inputs) multiplied by HARDCODED
+ * baselines (humanHourlyRate=85, estimatedIncidentCost=50000, modelCostPerRun=0.50) over an
+ * IN-MEMORY window that RESETS ON PROCESS RESTART (metricsStore / governanceEventsStore are
+ * not persisted to any durable store). costAvoidedUSD, netROI, and failureCostAvoided are
+ * therefore illustrative projections under stated assumptions — not field-measured outcomes.
+ * The report carries an `estimated: true` marker + a `basis` block stating these assumptions;
+ * see buildEstimationBasis().
  *
  * 3 tools:
  * - record_value_metric: Record a workflow metric (time saved, risk blocked, etc.)
@@ -22,6 +31,7 @@ import { z } from 'zod';
 import { GovernanceEngine } from '../../core/governance.js';
 import { MAX_INPUT_LENGTH } from '../../shared/constants.js';
 import { MaiClassification, GiaLayer } from '../../shared/types.js';
+import { persistValueMetric, isTelemetryPersistenceEnabled } from '../../core/persistence/telemetry-persistence.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // In-memory Value Metrics store for MCP server
@@ -60,6 +70,54 @@ const baselines = {
 };
 
 // ═══════════════════════════════════════════════════════════════════
+// M8 — Truth-in-labeling: honest estimation-basis annotation
+// Pure helper so both the MCP tool and the HTTP /api/gia/report path
+// emit the SAME assumptions/disclaimer. Does NOT change any math.
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Build the honest "this is an estimate" annotation that accompanies any
+ * economic ROI figures (costAvoidedUSD, netROI, failureCostAvoided).
+ *
+ * Surfaces, explicitly:
+ *  - that figures are ESTIMATES (not measured proof),
+ *  - the hardcoded baseline constants the estimate multiplies by,
+ *  - that inputs are caller-supplied counts over an in-memory window
+ *    that resets on process restart (not persisted, not measured).
+ *
+ * Pure: same baselines in → same object out. No side effects.
+ */
+export function buildEstimationBasis(bl: Readonly<typeof baselines>, durablyRecorded = false) {
+  return {
+    estimated: true as const,
+    method: 'illustrative-estimate' as const,
+    disclaimer:
+      'Illustrative estimate, not measured proof. Economic figures (costAvoided, netROI, ' +
+      'failureCostAvoided) are projected from caller-supplied workflow counts multiplied by ' +
+      'fixed baseline constants. The report window is in-memory and resets on process restart; ' +
+      'the inputs are reported, not independently measured.' +
+      (durablyRecorded
+        ? ' Raw metric rows are additionally persisted (INSERT-only) and each is anchored to the forensic ledger — the durable copy is an audit trail, not the report window.'
+        : ''),
+    baselineConstants: {
+      humanHourlyRateUSD: bl.humanHourlyRate,
+      estimatedIncidentCostUSD: bl.estimatedIncidentCost,
+      modelCostPerRunUSD: bl.modelCostPerRun,
+      avgManualMinutes: bl.avgManualMinutes,
+    },
+    dataProvenance: {
+      source: 'caller-supplied' as const,
+      storage: 'in-memory' as const,
+      // The REPORT WINDOW is never persisted (honest label unchanged);
+      // durablyRecorded says whether raw rows also land in value_metrics.
+      persisted: false as const,
+      resetsOnRestart: true as const,
+      durablyRecorded,
+    },
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TOOL REGISTRATIONS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -73,8 +131,10 @@ export function registerRecordValueMetricTool(server: McpServer, engine: Governa
       agent_id: z.string().max(100).describe('Agent that performed the workflow'),
       autonomy_level: z.enum(['assist', 'delegate', 'automate']).describe('Level of agent autonomy'),
       measurement_source: z.enum(['measured', 'estimated', 'derived']).default('estimated').describe('How values were obtained'),
-      time_saved_minutes: z.number().min(0).describe('Minutes of human time saved'),
-      risk_blocked_count: z.number().min(0).default(0).describe('Number of risks/violations blocked'),
+      // Bounds match migration 163: NUMERIC(10,2) and INT columns — an out-of-range
+      // value would silently drop ONLY the durable row (window/audit divergence).
+      time_saved_minutes: z.number().min(0).max(1_000_000).describe('Minutes of human time saved'),
+      risk_blocked_count: z.number().int().min(0).default(0).describe('Number of risks/violations blocked'),
       success: z.boolean().describe('Whether the workflow completed successfully'),
       task_complexity: z.enum(['low', 'medium', 'high']).default('medium').describe('Task complexity level'),
     },
@@ -96,13 +156,50 @@ export function registerRecordValueMetricTool(server: McpServer, engine: Governa
 
         metricsStore.push(entry);
 
+        // Forensic ledger anchor (task #18 — closes "the only value tool not
+        // ledger-anchored"; same in-file pattern as record_governance_event).
+        const ledgerEntry = engine.ledger.begin(
+          'record-value-metric',
+          MaiClassification.ADVISORY,
+          GiaLayer.MCP,
+          'SYSTEM'
+        );
+        ledgerEntry.addMetadata('workflowId', input.workflow_id);
+        ledgerEntry.addMetadata('workflowType', input.workflow_type);
+        ledgerEntry.addMetadata('agentId', input.agent_id);
+        ledgerEntry.addMetadata('measurementSource', input.measurement_source);
+        ledgerEntry.addMetadata('timeSavedMinutes', String(input.time_saved_minutes));
+        const score = engine.scorer.scoreDefault('record-value-metric');
+        const completedEntry = ledgerEntry.complete(score, {
+          classification: MaiClassification.ADVISORY,
+          confidence: 1.0,
+          rationale: `Value metric recorded: ${input.workflow_type} (${input.measurement_source})`,
+          requiresGate: false,
+        });
+        engine.ledger.record(completedEntry);
+
+        // Durable persistence (migration 163, fire-and-forget — the in-memory
+        // report window below is unchanged; this is the audit-trail copy).
+        persistValueMetric({
+          workflowId: input.workflow_id,
+          workflowType: input.workflow_type,
+          agentId: input.agent_id,
+          autonomyLevel: input.autonomy_level,
+          measurementSource: input.measurement_source,
+          timeSavedMinutes: input.time_saved_minutes,
+          riskBlockedCount: input.risk_blocked_count,
+          success: input.success,
+          taskComplexity: input.task_complexity,
+          ledgerEntryId: ledgerEntry.id,
+        });
+
         // Calculate running economic value
         const totalTimeSaved = metricsStore.reduce((sum, m) => sum + m.timeSavedMinutes, 0);
         const totalCostSaved = (totalTimeSaved / 60) * baselines.humanHourlyRate;
         const totalModelCost = metricsStore.length * baselines.modelCostPerRun;
 
-        // Tool accountability tracking
-        engine.telemetryService.emitToolCall('record_value_metric', `metric-${Date.now().toString(36)}`, 'ADVISORY', true);
+        // Tool accountability tracking — correlated on the real ledger anchor id
+        engine.telemetryService.emitToolCall('record_value_metric', ledgerEntry.id, 'ADVISORY', true);
 
         return { content: [{ type: 'text' as const, text: JSON.stringify({
           recorded: true,
@@ -195,7 +292,7 @@ export function registerRecordGovernanceEventTool(server: McpServer, engine: Gov
 export function registerGenerateImpactReportTool(server: McpServer, engine: GovernanceEngine): void {
   server.tool(
     'generate_impact_report',
-    'Generate a full economic + governance impact report. Returns pilot ROI data: time saved, cost avoided, risks blocked, success rate, autonomy trend, and confidence levels.',
+    'Generate a full economic + governance impact report. Returns an ILLUSTRATIVE ROI ESTIMATE (not measured proof): time saved, cost avoided, risks blocked, success rate, autonomy trend, and confidence levels. Economic figures are projected from caller-supplied counts times fixed baseline constants over an in-memory window that resets on restart; the response carries an `estimated` marker and a `basis` block with the stated assumptions.',
     {
       period_days: z.number().min(1).max(365).default(14).describe('Report period in days'),
       set_baselines: z.object({
@@ -261,9 +358,9 @@ export function registerGenerateImpactReportTool(server: McpServer, engine: Gove
         // Summary line
         const hours = Math.round(timeSaved / 60);
         const summary = [
-          `${input.period_days}-day pilot results:`,
-          `${hours} hours saved`,
-          `$${Math.round(costAvoided).toLocaleString()} cost avoided`,
+          `${input.period_days}-day estimated results (illustrative, not measured proof):`,
+          `~${hours} hours saved`,
+          `~$${Math.round(costAvoided).toLocaleString()} cost avoided`,
           `${governance.unsafeActionsBlocked} unsafe actions blocked`,
           `${incidents} incidents shipped`,
           `${reworkPrevented}% first-pass success rate`,
@@ -276,6 +373,10 @@ export function registerGenerateImpactReportTool(server: McpServer, engine: Gove
           periodEnd: new Date().toISOString(),
           periodDays: input.period_days,
           summary,
+          // M8 truth-in-labeling: top-level marker + assumptions/provenance basis.
+          // Economic figures below are estimates under these stated constants.
+          estimated: true,
+          basis: buildEstimationBasis(baselines, isTelemetryPersistenceEnabled()),
           economic: {
             timeSavedMinutes: Math.round(timeSaved),
             timeSavedHours: hours,

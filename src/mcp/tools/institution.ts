@@ -357,6 +357,19 @@ export function registerInstitutionTools(server: McpServer): void {
           }, null, 2) }],
         };
       } catch (err: unknown) {
+        // Route authz (strict) correctly denies the MCP service identity on
+        // reasoning-board writes — separation of duties: a service key must not
+        // approve a MANDATORY gate. Make that failure honest instead of generic.
+        if (err instanceof BoardApiError && err.statusCode === 403) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: 'HUMAN_APPROVAL_REQUIRED',
+              gate_id: args.gate_id,
+              message: 'This MANDATORY board gate requires a human approver. The MCP service identity is not permitted to approve gates (separation of duties). Approve it as a human operator in the Sanity Check console, or via the mobile approval link if gate notifications are configured.',
+            }, null, 2) }],
+            isError: true,
+          };
+        }
         return boardErrorResponse(err);
       }
     }

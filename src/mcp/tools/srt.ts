@@ -116,8 +116,11 @@ interface SRTIncident {
       timeToDiagnoseMinutes: number;
       timeToRepairMinutes: number;
       totalResolutionMinutes: number;
-      humanTimeSavedMinutes: number;
-      costAvoidedUSD: number;
+      // M10: ESTIMATES from a severity-bucket heuristic, not measured savings.
+      humanTimeSavedMinutes: number;     // estimated (severity-bucket heuristic)
+      costAvoidedUSD: number;            // estimated (severity-bucket heuristic)
+      roiEstimated?: boolean;            // true — marks the two fields above as estimates
+      roiBasis?: string;                 // 'severity-bucket heuristic'
       recurrenceCount: number;
     };
   };
@@ -126,8 +129,67 @@ interface SRTIncident {
   resolvedAt?: string;
 }
 
+/**
+ * Severity-bucket ROI heuristic for SRT postmortems.
+ *
+ * IMPORTANT (audit finding M10): the returned humanTimeSavedMinutes /
+ * costAvoidedUSD values are HEURISTIC ESTIMATES derived from hardcoded
+ * severity buckets — they are NOT measured savings. The `estimated` /
+ * `basis` annotations make that explicit wherever the result is surfaced
+ * or persisted. Time-to-detect / time-to-diagnose / time-to-repair (TTD /
+ * TTDiag / TTR) are real measurements and are computed elsewhere; this
+ * helper does not touch them.
+ *
+ * Buckets (unchanged from the original inline math):
+ *   manualEstimate:    CRITICAL=90, HIGH=60, otherwise 30 (minutes)
+ *   downtimeCost/min:  CRITICAL=$100, HIGH=$50, otherwise $10
+ *   humanTimeSaved = max(0, manualEstimate - round(totalActiveMinutes * 0.1))
+ *   costAvoided    = humanTimeSaved * downtimeCost
+ *
+ * @param severity            incident severity
+ * @param totalActiveMinutes  real measured TTD+TTDiag+TTR (minutes)
+ */
+export function estimateRepairRoi(
+  severity: string,
+  totalActiveMinutes: number,
+): {
+  humanTimeSavedMinutes: number;
+  costAvoidedUSD: number;
+  estimated: true;
+  basis: 'severity-bucket heuristic';
+} {
+  const manualEstimate = severity === 'CRITICAL' ? 90 : severity === 'HIGH' ? 60 : 30;
+  const humanTimeSaved = Math.max(0, manualEstimate - Math.round(totalActiveMinutes * 0.1));
+  const downtimeCost = severity === 'CRITICAL' ? 100 : severity === 'HIGH' ? 50 : 10;
+  const costAvoided = humanTimeSaved * downtimeCost;
+  return {
+    humanTimeSavedMinutes: humanTimeSaved,
+    costAvoidedUSD: costAvoided,
+    estimated: true,
+    basis: 'severity-bucket heuristic',
+  };
+}
+
 // In-memory stores
+const MAX_REPAIR_HISTORY = 100;
 const incidents = new Map<string, SRTIncident>();
+
+/**
+ * Bound the incidents Map to MAX_REPAIR_HISTORY entries.
+ * Evicts the oldest entries (by Map insertion order) when the cap is exceeded.
+ * Called after every new incident is added.
+ */
+function boundIncidentHistory(): void {
+  if (incidents.size > MAX_REPAIR_HISTORY) {
+    const overflow = incidents.size - MAX_REPAIR_HISTORY;
+    const keys = incidents.keys();
+    for (let i = 0; i < overflow; i++) {
+      const { value: key, done } = keys.next();
+      if (done) break;
+      incidents.delete(key);
+    }
+  }
+}
 
 // One-time recovery from PostgreSQL (awaited to eliminate race conditions)
 let srtRecoveryComplete = false;
@@ -422,7 +484,7 @@ const IS_CONTAINER = Boolean(
 /** API health URL — Docker internal or public */
 const API_HEALTH_URL = IS_CONTAINER
   ? 'http://ace-governance-api:3001/health'
-  : 'https://gia.aceadvising.com/api/health';
+  : 'https://gia.aceadvising.com/health';
 
 /** Frontend health URL — Docker internal or public (nginx-health only works internally) */
 const FRONTEND_HEALTH_URL = IS_CONTAINER
@@ -681,6 +743,7 @@ export function registerSRTRunWatchdogTool(server: McpServer, engine: Governance
           updatedAt: new Date().toISOString(),
         };
         incidents.set(incident.incidentId, incident);
+        boundIncidentHistory(); // Keep at most MAX_REPAIR_HISTORY entries
         persistIncident(incident); // Write-through to PostgreSQL
 
         // Auto-emit governance telemetry — probes found failures
@@ -845,8 +908,121 @@ export function registerSRTDiagnoseTool(server: McpServer, engine: GovernanceEng
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// SERVER EXECUTION BRIDGE — calls /api/srt/execute-from-mcp-gate
+// ═══════════════════════════════════════════════════════════════════
+
+interface ServerExecutionResult {
+  executed: true;
+  overallResult: string;
+  executionId: string;
+  totalDurationMs: number;
+  preRepairSnapshotId: string | null;
+  commandResults: Array<{ step: number; exitCode: number; durationMs: number; timedOut: boolean; stdout: string; stderr: string }>;
+}
+
+interface ServerExecutionFallback {
+  executed: false;
+  reason: string;
+}
+
+/**
+ * Attempt to execute the approved plan via the GIA server's real executor.
+ * Returns null if the server is not configured or unreachable — callers stay
+ * at PENDING_EXECUTION. NEVER throws; any error is caught and returned as fallback.
+ *
+ * `engineGateId` is the MaiGate gate id from the engine.gate.enforce() call
+ * that authorized this approval — NOT repairPlan.gateId (a local correlation
+ * ref). The server re-verifies it against gate_approvals_persistent and
+ * refuses to execute without a matching human-approval record (truth-map #2).
+ *
+ * Exported for tests only.
+ */
+export async function attemptServerExecution(
+  repairPlan: NonNullable<SRTIncident['repairPlan']>,
+  approvedBy: string,
+  engineGateId: string,
+): Promise<ServerExecutionResult | ServerExecutionFallback> {
+  const apiBase = process.env.GIA_API_URL ||
+    (IS_CONTAINER ? 'http://ace-governance-api:3001' : '');
+
+  if (!apiBase) {
+    return { executed: false, reason: 'GIA_API_URL not configured — execution pending manual trigger' };
+  }
+
+  const internalKey = process.env.GIA_INTERNAL_API_KEY || process.env.GIA_API_KEY || '';
+  if (!internalKey) {
+    return { executed: false, reason: 'GIA_INTERNAL_API_KEY not configured — execution pending manual trigger' };
+  }
+
+  try {
+    const resp = await fetch(`${apiBase}/api/srt/execute-from-mcp-gate`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${internalKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        incidentId: repairPlan.gateId,  // MCP uses gateId as incident correlation ref
+        planId: repairPlan.planId,
+        gateId: engineGateId,           // MaiGate id — server-side re-verification key
+        approvedBy,
+        commands: repairPlan.commands,
+        rollback: repairPlan.rollback,
+        successCriteria: repairPlan.successCriteria,
+      }),
+      signal: AbortSignal.timeout(120_000), // 2-min timeout — commands may take time
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      return { executed: false, reason: `Server returned ${resp.status}: ${errText.substring(0, 200)}` };
+    }
+
+    const data = await resp.json() as ServerExecutionResult;
+    return data;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { executed: false, reason: `Server unreachable: ${msg.substring(0, 200)}` };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // TOOL 3: srt_approve_repair (MANDATORY — human gate)
 // ═══════════════════════════════════════════════════════════════════
+
+/** Honest terminal state of an MCP-side SRT repair approval (the gate, not execution). */
+export interface McpRepairApprovalState {
+  gateStatus: 'APPROVED';
+  incidentStatus: 'REPAIR_APPROVED';
+  executionStatus: 'PENDING_EXECUTION';
+  /** No result — the MCP tool gates the repair; it does not execute commands. */
+  result: null;
+}
+
+function overallResultToNextStep(overallResult: string): string {
+  if (overallResult === 'SUCCESS') return 'Repair succeeded. Call srt_generate_postmortem to close the incident.';
+  if (overallResult === 'PARTIAL') return 'Repair partially succeeded. Review command results, then call srt_generate_postmortem.';
+  if (overallResult === 'ROLLED_BACK') return 'Commands failed and rollback ran. Diagnose root cause before re-attempting.';
+  return 'Repair failed. Check commandResults for the failing step, then re-diagnose.';
+}
+
+/**
+ * Compute the honest terminal state for an SRT repair APPROVAL via the MCP tool.
+ *
+ * srt_approve_repair is the MANDATORY human-in-the-loop gate. It approves the plan but
+ * DOES NOT execute repair commands — real execution is server-side
+ * (server/src/srt/srtCommandExecutor.executeRepairPlan). Approval therefore ends at
+ * APPROVED / PENDING_EXECUTION with no result. It must NEVER fabricate SUCCESS,
+ * REPAIR_COMPLETE, a completion time, or an "executed" command count (the H3 bug).
+ */
+export function computeRepairApprovalState(): McpRepairApprovalState {
+  return {
+    gateStatus: 'APPROVED',
+    incidentStatus: 'REPAIR_APPROVED',
+    executionStatus: 'PENDING_EXECUTION',
+    result: null,
+  };
+}
 
 export function registerSRTApproveRepairTool(server: McpServer, engine: GovernanceEngine): void {
   server.tool(
@@ -860,11 +1036,19 @@ export function registerSRTApproveRepairTool(server: McpServer, engine: Governan
     },
     { title: 'Approve or Reject Repair', readOnlyHint: false, idempotentHint: false, destructiveHint: true, openWorldHint: false },
     async (input) => {
-      // MANDATORY gate enforcement (pre-ledger — no point recording blocked agents)
-      if (!input.approved_by || input.approved_by === 'system' || input.approved_by === 'auto' || input.approved_by === 'agent') {
+      // Basic identity presence check. This is NOT the security boundary —
+      // actual authorization now comes from the real engine.gate.enforce()
+      // MANDATORY gate call below, not from trusting this free-text string.
+      // (Previously the only check here was a 4-string denylist — 'system',
+      // 'auto', 'agent', or empty — so any OTHER caller-supplied name, e.g.
+      // "plausible-human-name" or "bot42", was accepted as valid human
+      // approval for executing a real repair on infrastructure. Same
+      // self-report-trust bypass class fixed earlier for transfer_memory_pack,
+      // gia_apply_pack, and gia_run_patrol — 2026-07-14 MCP audit.)
+      if (!input.approved_by) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({
           error: 'MANDATORY_GATE_VIOLATION',
-          message: 'Repair approval requires a human operator. System/auto/agent approvals are BLOCKED.',
+          message: 'Repair approval requires an approver identity.',
           gateType: 'REPAIR_APPROVAL',
           maiLevel: 'MANDATORY',
         }) }], isError: true };
@@ -924,24 +1108,64 @@ export function registerSRTApproveRepairTool(server: McpServer, engine: Governan
           }, null, 2) }] };
         }
 
-        // Approve
-        incident.repairPlan.gateStatus = 'APPROVED';
+        // ── MANDATORY gate enforcement — a real engine.gate.enforce() call,
+        // checked BEFORE the repair is marked APPROVED. This is what makes
+        // srt_approve_repair a genuinely self-enforcing MANDATORY tool rather
+        // than a bare resolver that trusts a free-text approver name: the
+        // caller-supplied `approved_by` alone no longer authorizes anything —
+        // the gate must actually be resolved APPROVED via the approve_gate /
+        // board_approve_gate tools (or auto-run in non-production).
+        let gateDecision;
+        try {
+          gateDecision = await engine.gate.enforce(
+            MaiClassification.MANDATORY,
+            `srt-approve-repair:${input.incident_id}`,
+            entry.id,
+          );
+        } catch (gateError) {
+          const failedEntry = entry.fail(
+            gateError instanceof Error ? gateError : new Error(String(gateError)),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          engine.telemetryService.emitToolCall('srt_approve_repair', incident.incidentId, 'MANDATORY', false);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            message: `Repair approval requires MANDATORY gate approval: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+            incidentId: input.incident_id,
+          }, null, 2) }], isError: true };
+        }
+        entry.addMetadata('gateId', gateDecision.gateId);
+        entry.addMetadata('gateStatus', gateDecision.status);
+        if (gateDecision.status !== 'APPROVED') {
+          const failedEntry = entry.fail(
+            new Error(`MANDATORY gate ${gateDecision.status} for srt_approve_repair`),
+            MaiClassification.MANDATORY,
+          );
+          engine.ledger.record(failedEntry);
+          engine.telemetryService.emitToolCall('srt_approve_repair', incident.incidentId, 'MANDATORY', false);
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            error: 'GATE_REQUIRED',
+            gateId: gateDecision.gateId,
+            gateStatus: gateDecision.status,
+            message: 'Repair approval requires MANDATORY gate approval. Use approve_gate tool with the gate ID to approve.',
+            incidentId: input.incident_id,
+          }, null, 2) }], isError: true };
+        }
+
+        // Approve the gate. This tool is the MANDATORY human approval — it does NOT
+        // execute repair commands. Real execution is server-side
+        // (server/src/srt/srtCommandExecutor.executeRepairPlan). Approval therefore ends
+        // at APPROVED / PENDING_EXECUTION with NO result — we never fabricate SUCCESS,
+        // REPAIR_COMPLETE, a completion time, or an executed-command count (H3 fix).
+        const approval = computeRepairApprovalState();
+        incident.repairPlan.gateStatus = approval.gateStatus;
         incident.repairPlan.approvedBy = input.approved_by;
         incident.repairPlan.approvedAt = ts;
-        incident.status = 'REPAIR_APPROVED';
+        // result/executedAt/completedAt deliberately left unset — no execution has occurred.
+        incident.status = approval.incidentStatus;
         incident.updatedAt = ts;
-
-        // Mark as executing (in real deployment, this triggers server-side execution)
-        incident.repairPlan.executedAt = ts;
-        incident.status = 'REPAIR_EXECUTING';
-
-        // For v1, mark as success immediately (real execution is server-side)
-        // In production, this would wait for actual command execution results
-        incident.repairPlan.completedAt = new Date(Date.now() + (incident.repairPlan.estimatedMinutes * 60000)).toISOString();
-        incident.repairPlan.result = 'SUCCESS';
-        incident.status = 'REPAIR_COMPLETE';
-        incident.updatedAt = new Date().toISOString();
-        persistIncident(incident); // Write-through: approval + execution + completion
+        persistIncident(incident); // Write-through: approval only (no fabricated execution)
 
         const score = engine.scorer.scoreDefault(`srt-repair-${input.action}`);
         const completedEntry = entry.complete(score, {
@@ -954,15 +1178,55 @@ export function registerSRTApproveRepairTool(server: McpServer, engine: Governan
 
         engine.telemetryService.emitToolCall('srt_approve_repair', incident.incidentId, 'MANDATORY', true);
 
+        // Attempt server-side execution via the MCP→server wire.
+        // Best-effort: if the server is unreachable the gate stays APPROVED /
+        // PENDING_EXECUTION and the operator can execute manually. We NEVER
+        // fabricate a result — only real executor output is recorded.
+        const execResult = await attemptServerExecution(
+          incident.repairPlan, input.approved_by, gateDecision.gateId,
+        );
+
+        if (execResult.executed) {
+          // Real execution completed — update in-memory incident with real result
+          incident.repairPlan.result = execResult.overallResult;
+          incident.repairPlan.executedAt = new Date().toISOString();
+          incident.repairPlan.completedAt = new Date().toISOString();
+          incident.status = execResult.overallResult === 'SUCCESS' ? 'REPAIR_COMPLETE' : 'REPAIR_FAILED';
+          incident.updatedAt = new Date().toISOString();
+          persistIncident(incident);
+
+          return { content: [{ type: 'text' as const, text: JSON.stringify({
+            approved: true,
+            executed: true,
+            incidentId: incident.incidentId,
+            planId: incident.repairPlan.planId,
+            approvedBy: input.approved_by,
+            status: incident.status,
+            executionId: execResult.executionId,
+            overallResult: execResult.overallResult,
+            totalDurationMs: execResult.totalDurationMs,
+            preRepairSnapshotId: execResult.preRepairSnapshotId,
+            commandResults: execResult.commandResults,
+            gateSource: 'MCP_APPROVED',
+            note: 'Gate APPROVED and repair executed server-side via the MCP→server execution wire.',
+            nextStep: overallResultToNextStep(execResult.overallResult),
+          }, null, 2) }] };
+        }
+
+        // Server unreachable or not configured — gate stays APPROVED, execution pending
         return { content: [{ type: 'text' as const, text: JSON.stringify({
           approved: true,
+          executed: false,
           incidentId: incident.incidentId,
           planId: incident.repairPlan.planId,
           approvedBy: input.approved_by,
-          status: 'REPAIR_COMPLETE',
-          result: incident.repairPlan.result,
-          commandsExecuted: incident.repairPlan.commands.length,
-          nextStep: 'Call srt_generate_postmortem to create incident report.',
+          status: approval.incidentStatus,
+          executionStatus: approval.executionStatus,
+          result: approval.result,
+          commandsPlanned: incident.repairPlan.commands.length,
+          executionFallbackReason: execResult.reason,
+          note: 'Gate APPROVED. Server execution was attempted but did not complete — execute manually or retry.',
+          nextStep: 'Trigger execution via the SRT Console or re-call after confirming server connectivity.',
         }, null, 2) }] };
       } catch (error) {
         const failedEntry = entry.fail(error instanceof Error ? error : new Error(`SRT repair ${input.action} failed`), MaiClassification.MANDATORY);
@@ -981,7 +1245,7 @@ export function registerSRTApproveRepairTool(server: McpServer, engine: Governan
 export function registerSRTGeneratePostmortemTool(server: McpServer, engine: GovernanceEngine): void {
   server.tool(
     'srt_generate_postmortem',
-    'Generate a structured postmortem report for a completed SRT incident. Includes timeline, root cause, what worked/failed, prevention actions, metrics (TTD/TTDiag/TTR), and optional playbook delta. Classification: ADVISORY.',
+    'Generate a structured postmortem report for a completed SRT incident. Includes timeline, root cause, what worked/failed, prevention actions, real timing metrics (TTD/TTDiag/TTR), an ESTIMATED ROI (humanTimeSaved/costAvoided from a severity-bucket heuristic — not measured savings, flagged via roiEstimated/roiBasis), and optional playbook delta. Classification: ADVISORY.',
     {
       incident_id: z.string().describe('Incident ID to generate postmortem for'),
     },
@@ -1042,10 +1306,12 @@ export function registerSRTGeneratePostmortemTool(server: McpServer, engine: Gov
         const ttdiag = Math.max(0, Math.round((diagnosed - findingTime) / 60000));
         const ttr = Math.max(0, Math.round((repaired - diagnosed) / 60000));
 
-        const manualEstimate = incident.severity === 'CRITICAL' ? 90 : incident.severity === 'HIGH' ? 60 : 30;
-        const humanTimeSaved = Math.max(0, manualEstimate - Math.round((ttd + ttdiag + ttr) * 0.1));
-        const downtimeCost = incident.severity === 'CRITICAL' ? 100 : incident.severity === 'HIGH' ? 50 : 10;
-        const costAvoided = humanTimeSaved * downtimeCost;
+        // M10: ROI figures are a severity-bucket HEURISTIC ESTIMATE, not measured
+        // savings. The helper carries an explicit `estimated`/`basis` annotation.
+        // Bucket values + math are unchanged. (TTD/TTDiag/TTR above are real.)
+        const roi = estimateRepairRoi(incident.severity, ttd + ttdiag + ttr);
+        const humanTimeSaved = roi.humanTimeSavedMinutes;
+        const costAvoided = roi.costAvoidedUSD;
 
         // Similar incident count
         const similar = Array.from(incidents.values()).filter(i =>
@@ -1102,8 +1368,15 @@ export function registerSRTGeneratePostmortemTool(server: McpServer, engine: Gov
             timeToDiagnoseMinutes: ttdiag,
             timeToRepairMinutes: ttr,
             totalResolutionMinutes: ttd + ttdiag + ttr,
+            // M10: humanTimeSavedMinutes / costAvoidedUSD are ESTIMATES from a
+            // severity-bucket heuristic, NOT measured savings. Keys are kept under
+            // their original names (already persisted in srt_incidents_persistent
+            // postmortem JSONB — renaming would be a data seam); the annotation
+            // fields below mark them honestly. TTD/TTDiag/TTR are real measurements.
             humanTimeSavedMinutes: humanTimeSaved,
             costAvoidedUSD: costAvoided,
+            roiEstimated: roi.estimated,
+            roiBasis: roi.basis,
             recurrenceCount: similar.length,
           },
           timestamp: new Date().toISOString(),

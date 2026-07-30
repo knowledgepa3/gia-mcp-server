@@ -19,6 +19,8 @@
  * Migration: 035_governance_telemetry.sql
  */
 
+import { bootNotice } from '../../shared/bootNotice.js';
+
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
 let persistenceEnabled = false;
@@ -29,6 +31,24 @@ let droppedDelegationCount = 0;
 
 /** Max metadata size in characters (prevents JSONB bloat) */
 const MAX_METADATA_CHARS = 5000;
+
+/**
+ * Tenant attribution for governance events. gia-mcp is platform
+ * infrastructure with no per-request tenant identity (single platform API
+ * key — same surface shape as the mcpGateway MCP_TOOL_CALL audit writes), so
+ * events are attributed to the platform tenant. Before 2026-06-12 the INSERT
+ * omitted tenant_id entirely and every row landed in the 'default' bucket
+ * (migration 135 backfilled those). Not a secret — plain env read is allowed.
+ */
+const PLATFORM_TENANT_ID = process.env.PLATFORM_PRIMARY_TENANT_ID || 'default';
+// Only actionable when rows are actually being written. On the embedded path
+// (no DATABASE_URL) nothing persists, so tenant attribution is moot — warning
+// there made the first line of a normal `npx gia-mcp-server` run look like a
+// misconfiguration. When persistence IS on, a wrong tenant bucket is a real
+// compliance gap, so the warning stays unconditional in that case.
+if (!process.env.PLATFORM_PRIMARY_TENANT_ID && process.env.DATABASE_URL) {
+  console.error('[Telemetry-Persist] PLATFORM_PRIMARY_TENANT_ID not set — governance events will stamp tenant_id=\'default\'');
+}
 
 /**
  * Get counts of events that failed to persist after retry.
@@ -81,7 +101,7 @@ function sanitizeMetadata(metadata?: Record<string, unknown>): string {
 export async function initTelemetryPersistence(): Promise<boolean> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('[Telemetry-Persist] No DATABASE_URL — running in-memory only');
+    bootNotice('[Telemetry-Persist] No DATABASE_URL — running in-memory only');
     return false;
   }
 
@@ -110,6 +130,7 @@ export async function initTelemetryPersistence(): Promise<boolean> {
           mai_level       VARCHAR(20),
           details         TEXT NOT NULL,
           metadata        JSONB DEFAULT '{}',
+          tenant_id       TEXT NOT NULL DEFAULT 'default',
           created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
@@ -120,6 +141,8 @@ export async function initTelemetryPersistence(): Promise<boolean> {
       await client.query('CREATE INDEX IF NOT EXISTS idx_gov_events_mai ON governance_events(mai_level)');
       await client.query('CREATE INDEX IF NOT EXISTS idx_gov_events_audit_id ON governance_events(source_audit_id)');
       await client.query('CREATE INDEX IF NOT EXISTS idx_gov_events_type_created ON governance_events(event_type, created_at DESC)');
+      // tenant index — matches migration 084_runtime_tenant_isolation.sql
+      await client.query('CREATE INDEX IF NOT EXISTS idx_governance_events_tenant ON governance_events(tenant_id, created_at DESC)');
 
       await client.query(`
         CREATE TABLE IF NOT EXISTS agent_delegations (
@@ -149,6 +172,35 @@ export async function initTelemetryPersistence(): Promise<boolean> {
       await client.query('CREATE INDEX IF NOT EXISTS idx_delegations_drift ON agent_delegations(drift_flag) WHERE drift_flag = TRUE');
       await client.query('CREATE INDEX IF NOT EXISTS idx_delegations_created ON agent_delegations(created_at)');
       await client.query('CREATE INDEX IF NOT EXISTS idx_delegations_parent_audit ON agent_delegations(parent_audit_id)');
+    }
+
+    // value_metrics (task #18) — verified separately so a DB missing only
+    // migration 163 doesn't silently drop every durable metric row while
+    // isTelemetryPersistenceEnabled() reports true. Fallback matches
+    // 163_value_metrics.sql exactly (governance_events/035 precedent).
+    try {
+      await client.query('SELECT 1 FROM value_metrics LIMIT 0');
+    } catch {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS value_metrics (
+          id                  BIGSERIAL PRIMARY KEY,
+          workflow_id         VARCHAR(100) NOT NULL,
+          workflow_type       VARCHAR(100) NOT NULL,
+          agent_id            VARCHAR(100) NOT NULL,
+          autonomy_level      VARCHAR(20)  NOT NULL CHECK (autonomy_level IN ('assist','delegate','automate')),
+          measurement_source  VARCHAR(20)  NOT NULL CHECK (measurement_source IN ('measured','estimated','derived')),
+          time_saved_minutes  NUMERIC(10,2) NOT NULL,
+          risk_blocked_count  INT          NOT NULL DEFAULT 0,
+          success             BOOLEAN      NOT NULL,
+          task_complexity     VARCHAR(10)  NOT NULL CHECK (task_complexity IN ('low','medium','high')),
+          ledger_entry_id     TEXT,
+          tenant_id           TEXT         NOT NULL DEFAULT 'default',
+          recorded_at         TIMESTAMPTZ  NOT NULL DEFAULT now()
+        )
+      `);
+      await client.query('CREATE INDEX IF NOT EXISTS idx_value_metrics_recorded ON value_metrics (recorded_at DESC)');
+      await client.query('CREATE INDEX IF NOT EXISTS idx_value_metrics_workflow ON value_metrics (workflow_type, recorded_at)');
+      await client.query('CREATE INDEX IF NOT EXISTS idx_value_metrics_tenant ON value_metrics (tenant_id, recorded_at DESC)');
     }
     client.release();
 
@@ -201,8 +253,8 @@ export function persistGovernanceEvent(event: GovernanceEventRecord): void {
   if (!persistenceEnabled || !pool) return;
 
   fireAndForgetQuery(
-    `INSERT INTO governance_events (event_type, source_tool, source_audit_id, mai_level, details, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+    `INSERT INTO governance_events (event_type, source_tool, source_audit_id, mai_level, details, metadata, tenant_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
     [
       event.eventType,
       event.sourceTool || null,
@@ -210,9 +262,66 @@ export function persistGovernanceEvent(event: GovernanceEventRecord): void {
       event.maiLevel || null,
       event.details,
       sanitizeMetadata(event.metadata),
+      PLATFORM_TENANT_ID,
     ],
     'Event',
     () => { droppedEventCount++; }
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// VALUE METRIC PERSISTENCE (task #18 — durable home for record_value_metric)
+// ═══════════════════════════════════════════════════════════════════
+
+export interface ValueMetricRecord {
+  workflowId: string;
+  workflowType: string;
+  agentId: string;
+  autonomyLevel: 'assist' | 'delegate' | 'automate';
+  measurementSource: 'measured' | 'estimated' | 'derived';
+  timeSavedMinutes: number;
+  riskBlockedCount: number;
+  success: boolean;
+  taskComplexity: 'low' | 'medium' | 'high';
+  /** Forensic-ledger anchor id written by the MCP tool (existing engine.ledger writer). */
+  ledgerEntryId?: string;
+}
+
+let droppedValueMetricCount = 0;
+
+/** Count of value metrics that failed to persist after retry (compliance gap signal). */
+export function getDroppedValueMetricCount(): number {
+  return droppedValueMetricCount;
+}
+
+/**
+ * Persist a value metric (INSERT-only table, migration 163). Fire-and-forget —
+ * same contract as persistGovernanceEvent: silent no-op without DATABASE_URL.
+ */
+export function persistValueMetric(metric: ValueMetricRecord): void {
+  if (!persistenceEnabled || !pool) return;
+
+  fireAndForgetQuery(
+    `INSERT INTO value_metrics (
+       workflow_id, workflow_type, agent_id, autonomy_level, measurement_source,
+       time_saved_minutes, risk_blocked_count, success, task_complexity,
+       ledger_entry_id, tenant_id
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+    [
+      metric.workflowId,
+      metric.workflowType,
+      metric.agentId,
+      metric.autonomyLevel,
+      metric.measurementSource,
+      metric.timeSavedMinutes,
+      metric.riskBlockedCount,
+      metric.success,
+      metric.taskComplexity,
+      metric.ledgerEntryId || null,
+      PLATFORM_TENANT_ID,
+    ],
+    'ValueMetric',
+    () => { droppedValueMetricCount++; }
   );
 }
 

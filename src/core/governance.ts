@@ -34,6 +34,7 @@ import {
   type IGateDecision,
   GiaLayer,
   EntryStatus,
+  GateStatus,
 } from '../shared/types.js';
 import { GovernedError } from '../shared/errors.js';
 import { generateAuditId, utcNow } from '../shared/utils.js';
@@ -72,6 +73,45 @@ function computeKernelConfigFingerprint(): string {
   return createHash('sha256').update(JSON.stringify(config)).digest('hex');
 }
 
+/**
+ * Verdict from comparing the computed kernel fingerprint against a pinned value.
+ *   - 'unset': no expected pin configured — verification is a no-op.
+ *   - 'match': the pin equals the computed fingerprint.
+ *   - 'drift': mismatch — governance law changed since the pin was set. `halt`
+ *     indicates whether the engine should refuse to start (only when explicitly
+ *     enforced) versus alert-only.
+ */
+export type FingerprintVerdict =
+  | { status: 'unset' }
+  | { status: 'match' }
+  | { status: 'drift'; halt: boolean };
+
+/**
+ * Verify a computed kernel config fingerprint against an optional pinned value.
+ *
+ * Pure and side-effect-free so it is unit-testable without booting the engine.
+ * Comparison is case-insensitive and whitespace-tolerant (hex hashes only).
+ *
+ * Secure-by-default-without-bricking: an unset/empty pin is a no-op, so a
+ * deployment that has not opted in is never blocked. A mismatch alerts by
+ * default and only requests a halt when `enforceMode === 'halt'` — this avoids
+ * the "blanket fail-closed bricks boot" landmine while still making drift loud.
+ *
+ * @param computed     The fingerprint computed from the running config.
+ * @param expected     The pinned expected fingerprint (e.g. GIA_EXPECTED_CONFIG_FINGERPRINT).
+ * @param enforceMode  Enforcement mode (e.g. GIA_FINGERPRINT_ENFORCE); 'halt' refuses boot on drift.
+ */
+export function verifyConfigFingerprint(
+  computed: string,
+  expected: string | undefined,
+  enforceMode: string | undefined,
+): FingerprintVerdict {
+  const pin = (expected ?? '').trim();
+  if (pin === '') return { status: 'unset' };
+  if (pin.toLowerCase() === computed.trim().toLowerCase()) return { status: 'match' };
+  return { status: 'drift', halt: (enforceMode ?? '').trim().toLowerCase() === 'halt' };
+}
+
 import { ForensicLedger, type AuditEntryBuilder } from './audit/ledger.js';
 import { TelemetryCollector } from './audit/telemetry.js';
 import { MaiClassifier } from './mai/classifier.js';
@@ -80,6 +120,15 @@ import { type IClassificationContext } from './mai/types.js';
 import { GovernanceScorer, type IScoringCriteria } from './scoring/scorer.js';
 import { StoreyThresholdMonitor } from './threshold/monitor.js';
 import { ThresholdHealthAssessor } from './threshold/health.js';
+import { ModelRoutingThresholdMonitor } from './threshold/routing-monitor.js';
+import { RoutingBandStatus, type IRoutingHealthReport } from './threshold/routing-types.js';
+import { ROUTING_THRESHOLD_DEFAULTS, TIER_PRICING_USD_PER_MTOK } from '../config/routing-threshold.config.js';
+import {
+  initRoutingPersistence,
+  loadRoutingObservations,
+  setPremiumRoutingHaltFlag,
+  getPremiumRoutingHaltFlag,
+} from './persistence/routing-persistence.js';
 import { Supervisor } from './supervisor/supervisor.js';
 
 // Persistence layers — write-through to PostgreSQL
@@ -229,6 +278,7 @@ export class GovernanceEngine {
   public readonly gate: MaiGate;
   public readonly scorer: GovernanceScorer;
   public readonly thresholdMonitor: StoreyThresholdMonitor;
+  public readonly routingMonitor: ModelRoutingThresholdMonitor;
   public readonly healthAssessor: ThresholdHealthAssessor;
   public readonly supervisor: Supervisor;
   public readonly telemetry: TelemetryCollector;
@@ -247,6 +297,12 @@ export class GovernanceEngine {
     this.gate = new MaiGate();
     this.scorer = new GovernanceScorer();
     this.thresholdMonitor = new StoreyThresholdMonitor();
+    this.routingMonitor = new ModelRoutingThresholdMonitor(
+      ROUTING_THRESHOLD_DEFAULTS,
+      TIER_PRICING_USD_PER_MTOK,
+      this.ledger,
+      this.scorer,
+    );
     this.healthAssessor = new ThresholdHealthAssessor(this.thresholdMonitor);
     this.supervisor = new Supervisor(this.ledger);
     this.telemetryService = new GovernanceTelemetryService();
@@ -274,6 +330,65 @@ export class GovernanceEngine {
   /** Check if sampling is available without throwing. */
   hasSampling(): boolean {
     return this._sampling !== null;
+  }
+
+  // ─── Model Routing Threshold (MRT) ───────────────────────────────────────
+
+  /** True while a CRITICAL routing report has premium-tier routing gated. */
+  private _premiumRoutingHalted = false;
+
+  get premiumRoutingHalted(): boolean {
+    return this._premiumRoutingHalted;
+  }
+
+  /**
+   * Assess model routing health over a window.
+   *
+   * Hydrates the routing monitor from the shared routing_observations table
+   * (written by the server-side LLM kernel — the egress chokepoint), then
+   * assesses. On overall CRITICAL, premium-tier routing is halted and a
+   * MANDATORY gate is opened (fire-and-forget): a human must approve with
+   * rationale to resume. REJECTED or TIMED_OUT leaves the halt in place —
+   * fail safe, never fail open.
+   */
+  async assessRoutingHealth(windowStart: Date, windowEnd: Date): Promise<IRoutingHealthReport> {
+    const dbObservations = await loadRoutingObservations(windowStart, windowEnd);
+    this.routingMonitor.hydrate(dbObservations);
+
+    const report = this.routingMonitor.assessHealth(windowStart, windowEnd);
+
+    if (report.overallStatus === RoutingBandStatus.CRITICAL && !this._premiumRoutingHalted) {
+      this.armPremiumRoutingHalt(report.auditId);
+    }
+
+    return report;
+  }
+
+  /**
+   * Arm the premium-routing halt: set the in-memory flag, write the durable
+   * shared flag (the kernel in ace-server enforces it at the egress
+   * chokepoint with a 30s cache), and open a MANDATORY gate fire-and-forget.
+   * APPROVED clears both flags; REJECTED/TIMED_OUT/gate-failure leaves the
+   * halt in place — fail safe, never fail open.
+   */
+  private armPremiumRoutingHalt(auditId: string): void {
+    this._premiumRoutingHalted = true;
+    void setPremiumRoutingHaltFlag(true, 'mrt-monitor');
+    this.gate
+      .enforce(
+        MaiClassification.MANDATORY,
+        'routing-threshold-critical — premium-tier routing halted pending human review',
+        auditId,
+      )
+      .then((decision) => {
+        if (decision.status === GateStatus.APPROVED) {
+          this._premiumRoutingHalted = false;
+          void setPremiumRoutingHaltFlag(false, 'mrt-gate-approval');
+        }
+      })
+      .catch(() => {
+        // Gate machinery failure leaves the halt in place — fail safe.
+      });
   }
 
   /**
@@ -317,6 +432,20 @@ export class GovernanceEngine {
     // Clean up stale pending gates from any previous crashed session
     if (gatePersisted) {
       await cleanupStaleGates();
+    }
+
+    // MRT: routing observation hydration (shared table written by the
+    // server-side LLM kernel — the egress chokepoint). Non-fatal: without
+    // a DB the monitor reports INSUFFICIENT_DATA, never a false HEALTHY.
+    await initRoutingPersistence();
+
+    // MRT halt re-arm: if a premium-routing halt was active when this
+    // process last died, the original gate Promise died with it — but the
+    // durable flag did not. Re-open a fresh MANDATORY gate rather than
+    // silently resuming (resumption requires human approval, always).
+    if (await getPremiumRoutingHaltFlag()) {
+      console.error('[GovernanceEngine] Premium-routing halt found armed at boot — re-opening MANDATORY gate');
+      this.armPremiumRoutingHalt('mrt-halt-rearm-after-restart');
     }
 
     // Verify all components are healthy
@@ -364,6 +493,40 @@ export class GovernanceEngine {
       requiresGate: false,
     });
     this.ledger.record(completedManifest);
+
+    // Kernel config fingerprint VERIFICATION (opt-in, secure-without-bricking).
+    // If an expected fingerprint is pinned (GIA_EXPECTED_CONFIG_FINGERPRINT),
+    // compare it to the value just stamped on the manifest. Drift = governance
+    // law changed since the pin: record a MANDATORY forensic event + alert.
+    // Refuse to start ONLY when GIA_FINGERPRINT_ENFORCE=halt is explicitly set,
+    // so an unconfigured deployment can never be bricked by this check.
+    const fpVerdict = verifyConfigFingerprint(
+      instanceCtx.configFingerprint,
+      process.env['GIA_EXPECTED_CONFIG_FINGERPRINT'],
+      process.env['GIA_FINGERPRINT_ENFORCE'],
+    );
+    if (fpVerdict.status === 'drift') {
+      const expectedFp = (process.env['GIA_EXPECTED_CONFIG_FINGERPRINT'] ?? '').trim();
+      const driftEntry = this.ledger.begin('kernel-config-drift-detected', MaiClassification.MANDATORY);
+      driftEntry.addMetadata('computedFingerprint', instanceCtx.configFingerprint);
+      driftEntry.addMetadata('expectedFingerprint', expectedFp);
+      driftEntry.addMetadata('enforceMode', (process.env['GIA_FINGERPRINT_ENFORCE'] ?? 'alert').trim());
+      driftEntry.addMetadata('halted', fpVerdict.halt);
+      const driftScore = this.scorer.scoreDefault('kernel-config-drift-detected');
+      const completedDrift = driftEntry.complete(driftScore, {
+        classification: MaiClassification.MANDATORY,
+        confidence: 1.0,
+        rationale: `Kernel config fingerprint MISMATCH — expected ${expectedFp.slice(0, 16)}…, computed ${instanceCtx.configFingerprint.slice(0, 16)}…. The governed law changed since the pinned value. ${fpVerdict.halt ? 'Refusing to start (GIA_FINGERPRINT_ENFORCE=halt).' : 'Alert-only — set GIA_FINGERPRINT_ENFORCE=halt to refuse boot on drift.'}`,
+        requiresGate: false,
+      });
+      this.ledger.record(completedDrift);
+      console.error(`[GovernanceEngine] ⚠️ CONFIG FINGERPRINT DRIFT — expected ${expectedFp.slice(0, 16)}…, computed ${instanceCtx.configFingerprint.slice(0, 16)}…${fpVerdict.halt ? ' — refusing to start.' : ' — alert-only.'}`);
+      if (fpVerdict.halt) {
+        throw new Error('Kernel config fingerprint mismatch — refusing to start (GIA_FINGERPRINT_ENFORCE=halt). Governance config differs from the pinned GIA_EXPECTED_CONFIG_FINGERPRINT.');
+      }
+    } else if (fpVerdict.status === 'match') {
+      console.error(`[GovernanceEngine] Config fingerprint verified against pinned value (${instanceCtx.configFingerprint.slice(0, 16)}…).`);
+    }
 
     this.initialized = true;
 

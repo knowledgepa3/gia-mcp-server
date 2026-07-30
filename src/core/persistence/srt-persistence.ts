@@ -20,6 +20,8 @@
  * - Upsert: update on conflict for status transitions
  */
 
+import { bootNotice } from '../../shared/bootNotice.js';
+
 /** PostgreSQL pool — lazy initialized */
 let pool: any = null;
 let persistenceEnabled = false;
@@ -30,7 +32,7 @@ let persistenceEnabled = false;
 export async function initSRTPersistence(): Promise<boolean> {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
-    console.error('[SRT-Persist] No DATABASE_URL — running in-memory only');
+    bootNotice('[SRT-Persist] No DATABASE_URL — running in-memory only');
     return false;
   }
 

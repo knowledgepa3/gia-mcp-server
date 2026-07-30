@@ -1,31 +1,36 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.knowledgepa3/gia-mcp-server",
-  "title": "GIA Governance Intelligence Automation",
-  "description": "AI governance engine — decision controls, MAI classification, compliance mapping, forensic audit chains, and human-in-the-loop gates. Runs embedded (no remote server required).",
+  "title": "GIA — Governed Intelligence Architecture",
+  "description": "Runtime governance layer for AI agents: MAI decision classification, human-in-the-loop gates, hash-chained forensic audit, governed context authority, and compliance mapping (NIST AI RMF, EU AI Act, ISO 42001, SOC 2, CMMC). Model-agnostic — runs embedded, no remote service required.",
   "repository": {
     "url": "https://github.com/knowledgepa3/gia-mcp-server",
     "source": "github"
   },
-  "version": "0.3.6",
+  "version": "0.4.3",
   "websiteUrl": "https://gia.aceadvising.com",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "gia-mcp-server",
-      "version": "0.3.6",
+      "version": "0.4.3",
       "transport": {
         "type": "stdio"
       },
       "environment_variables": [
         {
           "name": "DATABASE_URL",
-          "description": "PostgreSQL connection string for audit trail persistence (optional — governance engine works in-memory without it)",
+          "description": "PostgreSQL connection string for a persistent forensic audit trail (optional — the governance engine runs in-memory without it)",
+          "required": false
+        },
+        {
+          "name": "GIA_TOOL_VISIBILITY",
+          "description": "Tool visibility tier: public | tenant | operator (optional — local stdio defaults to operator)",
           "required": false
         },
         {
           "name": "GIA_API_KEY",
-          "description": "API key for the hosted GIA cloud platform (optional — only needed to connect to gia.aceadvising.com)",
+          "description": "API key for the hosted GIA platform (optional — only needed when connecting to gia.aceadvising.com instead of running embedded)",
           "required": false
         }
       ]
@@ -37,8 +42,8 @@
       "url": "https://gia.aceadvising.com/mcp",
       "headers": [
         {
-          "description": "GIA API key for authentication",
-          "name": "x-api-key",
+          "description": "Bearer <GIA_API_KEY> — the endpoint accepts an Authorization bearer token or a GIA_API_KEY query parameter. It does NOT accept x-api-key.",
+          "name": "Authorization",
           "required": true
         }
       ]

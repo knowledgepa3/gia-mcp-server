@@ -2,8 +2,8 @@
  * @module    mcp-tool-generate-report
  * @layer     TRANSPORT
  * @inherits  governance-root
- * @mai       N/A
- * @audit     false
+ * @mai       INFORMATIONAL — records a report summary, non-blocking (no gate)
+ * @audit     true — appends a 'generate-report' entry to the forensic ledger
  * @owner     William J. Storey III / ACE / GIA
  */
 
@@ -11,9 +11,49 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { GovernanceEngine } from '../../core/governance.js';
 import { GIA_VERSION, GIA_AUTHOR } from '../../shared/constants.js';
-import { EntryStatus } from '../../shared/types.js';
+import { EntryStatus, MaiClassification, GiaLayer } from '../../shared/types.js';
+
+/** Lean summary of a generated report — what gets anchored (not the full body). */
+export interface GovernanceReportSummary {
+  systemHealthStatus: string;
+  thresholdRate: string;
+  thresholdStatus: string;
+  auditChainIntegrity: string;
+  totalOperations: number;
+}
+
+/**
+ * Anchor a governance report in the immutable forensic ledger as a
+ * 'generate-report' entry. Records a LEAN summary (health, threshold, chain
+ * integrity, op count) — never the full multi-KB report body, keeping ledger
+ * metadata compact. INFORMATIONAL + requiresGate:false. No PII — aggregate
+ * governance metrics only.
+ */
+export function recordGovernanceReport(
+  engine: GovernanceEngine,
+  format: string,
+  summary: GovernanceReportSummary,
+): string {
+  const entry = engine.ledger.begin('generate-report', MaiClassification.INFORMATIONAL, GiaLayer.CORE, 'SYSTEM');
+  entry.addMetadata('format', format);
+  entry.addMetadata('systemHealthStatus', summary.systemHealthStatus);
+  entry.addMetadata('thresholdRate', summary.thresholdRate);
+  entry.addMetadata('thresholdStatus', summary.thresholdStatus);
+  entry.addMetadata('auditChainIntegrity', summary.auditChainIntegrity);
+  entry.addMetadata('totalOperations', summary.totalOperations);
+
+  const score = engine.scorer.scoreDefault('generate-report');
+  const completedEntry = entry.complete(score, {
+    classification: MaiClassification.INFORMATIONAL,
+    confidence: 0.85,
+    rationale: `Governance report generated (${format}): health=${summary.systemHealthStatus}, chain=${summary.auditChainIntegrity}`,
+    requiresGate: false,
+  });
+  engine.ledger.record(completedEntry);
+  return entry.id;
+}
 import { getIntelligenceStats } from '../../core/persistence/intelligence-persistence.js';
-import { getDroppedCounts } from '../../core/persistence/telemetry-persistence.js';
+import { getDroppedCounts, getDroppedValueMetricCount } from '../../core/persistence/telemetry-persistence.js';
 import { getDroppedSessionCount } from '../../core/persistence/runtime-persistence.js';
 
 export function registerGenerateReportTool(server: McpServer, engine: GovernanceEngine): void {
@@ -171,6 +211,7 @@ export function registerGenerateReportTool(server: McpServer, engine: Governance
           bufferSize: engine.telemetryService.bufferSize,
           droppedEvents: getDroppedCounts(),
           droppedSessions: getDroppedSessionCount(),
+          droppedValueMetrics: getDroppedValueMetricCount(),
           status: 'ACTIVE',
         },
         runtimeAccountability: (() => {
@@ -247,8 +288,17 @@ export function registerGenerateReportTool(server: McpServer, engine: Governance
         },
       };
 
-      // Tool accountability tracking
-      engine.telemetryService.emitToolCall('generate_report', `report-${Date.now().toString(36)}`, 'INFORMATIONAL', true);
+      // Anchor a lean summary of the report in the immutable forensic ledger.
+      const auditId = recordGovernanceReport(engine, input.format, {
+        systemHealthStatus: health.severity,
+        thresholdRate: `${(threshold.escalationRate * 100).toFixed(1)}%`,
+        thresholdStatus: threshold.status,
+        auditChainIntegrity: chainVerification.valid ? 'INTACT' : 'BROKEN',
+        totalOperations: telemetry.totalOperations,
+      });
+
+      // Tool accountability tracking — correlated to the ledger entry via auditId.
+      engine.telemetryService.emitToolCall('generate_report', auditId, 'INFORMATIONAL', true);
 
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(report, null, 2) }],

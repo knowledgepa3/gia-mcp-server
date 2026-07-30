@@ -22,35 +22,20 @@ import { GovernedError } from '../shared/errors.js';
 import { generateAuditId, sanitize } from '../shared/utils.js';
 import { ACE_MAI_CONFIG, GOVERNANCE_CONFIG } from '../config/governance.config.js';
 
-// Import tool handlers (thin wrappers)
-import { registerClassifyDecisionTool } from './tools/classify-decision.js';
-import { registerEvaluateThresholdTool } from './tools/evaluate-threshold.js';
-import { registerScoreGovernanceTool } from './tools/score-governance.js';
-import { registerAuditPipelineTool } from './tools/audit-pipeline.js';
-import { registerMonitorAgentsTool } from './tools/monitor-agents.js';
-import { registerMapComplianceTool } from './tools/map-compliance.js';
-import { registerAssessRiskTierTool } from './tools/assess-risk-tier.js';
-import { registerGenerateReportTool } from './tools/generate-report.js';
-import { registerSystemStatusTool } from './tools/system-status.js';
-import { registerApproveGateTool } from './tools/approve-gate.js';
-import { registerAgentRightsTool } from './tools/agent-rights.js';
-import { registerPrecedentTools } from './tools/precedent.js';
-import { registerCitizenshipTools } from './tools/citizenship.js';
-import { registerBranchAuthorityTools } from './tools/branchAuthority.js';
-import { registerColonyTools } from './tools/colony.js';
-import { registerMemoryPackTools } from './tools/memory-packs.js';
-import { registerValueMetricsTools } from './tools/value-metrics.js';
-import { registerSRTTools } from './tools/srt.js';
-import { registerVerifyLedgerTool } from './tools/verify-ledger.js';
-import { registerExportLedgerTool } from './tools/export-ledger.js';
-import { registerRemediationPackTools } from './tools/remediation-packs.js';
-import { registerPhoenixRecoveryTools } from './tools/phoenix-recovery.js';
+// Tool registration function references + visibility tiers live in
+// toolRegistry.ts (moved 2026-07-14 — see file header there for why: import
+// side effects). server.ts only needs the array and the type here.
+import { TOOL_REGISTRY, type ToolVisibility } from './toolRegistry.js';
+// Authoritative tool count — proven equal to the registered tool set by
+// tests/mcp/tool-classification-drift.test.ts. Never hand-count.
+import { GIA_TOOL_COUNT } from './toolClassifications.js';
+// Re-export the type (not the array/value) for existing consumers (e.g.
+// server-http.ts) that import ToolVisibility from server.js. TOOL_REGISTRY
+// itself is intentionally NOT re-exported here — it flows through
+// src/index.ts's `export *`, the published npm package's public entry point,
+// and would expose operator-tier-only registration functions to consumers.
+export type { ToolVisibility } from './toolRegistry.js';
 import { registerGovernedRetrievalTools } from './tools/governed-retrieval.js';
-import { registerContextAuthorityTool } from './tools/context-authority.js';
-import { registerInstitutionTools } from './tools/institution.js';
-import { registerContextReviveTool } from './tools/context-revive.js';
-import { registerGovernedSamplingTool } from './tools/governed-sampling.js';
-import { registerChainOfReasoningTools } from './tools/chain-of-reasoning.js';
 import { GovernedSampling } from '../core/sampling/index.js';
 
 // Runtime accountability instrumentation — wraps server.tool() registrations
@@ -75,52 +60,12 @@ import { registerPrompts } from './prompts/index.js';
 // The Smithery gateway and all HTTP clients get PUBLIC by default.
 // Paying customers (professional/enterprise DB keys) get PUBLIC + TENANT.
 // Local stdio (Claude Code / Claude Desktop) gets all tiers (OPERATOR).
+//
+// TOOL_REGISTRY itself (the array + its tier metadata) lives in
+// toolRegistry.ts — imported above — so it can be introspected (e.g. by the
+// tool-classification drift test) without triggering this module's
+// import-time main() boot sequence.
 // ============================================================================
-
-export type ToolVisibility = 'public' | 'tenant' | 'operator';
-
-/**
- * Maps each tool registration function to its visibility tier.
- * Grouped by the tier each set of tools belongs to.
- */
-const TOOL_REGISTRY: Array<{
-  tier: ToolVisibility;
-  register: (server: McpServer, engine: GovernanceEngine) => void;
-  description: string;
-}> = [
-  // --- PUBLIC: Stateless governance scoring — no data exposure ---
-  { tier: 'public', register: registerClassifyDecisionTool, description: 'classify_decision' },
-  { tier: 'public', register: registerEvaluateThresholdTool, description: 'evaluate_threshold' },
-  { tier: 'public', register: registerScoreGovernanceTool, description: 'score_governance' },
-  { tier: 'public', register: registerAssessRiskTierTool, description: 'assess_risk_tier' },
-  { tier: 'public', register: registerMapComplianceTool, description: 'map_compliance' },
-  { tier: 'public', register: registerVerifyLedgerTool, description: 'verify_ledger' },
-
-  // --- TENANT: Data-bearing tools, scoped to authenticated tenant ---
-  { tier: 'tenant', register: registerAuditPipelineTool, description: 'audit_pipeline' },
-  { tier: 'tenant', register: registerMonitorAgentsTool, description: 'monitor_agents' },
-  { tier: 'tenant', register: registerSystemStatusTool, description: 'system_status' },
-  { tier: 'tenant', register: registerGenerateReportTool, description: 'generate_report' },
-  { tier: 'tenant', register: registerExportLedgerTool, description: 'export_ledger' },
-  { tier: 'tenant', register: registerValueMetricsTools, description: 'value_metrics (record_value_metric, record_governance_event, generate_impact_report)' },
-  { tier: 'tenant', register: registerMemoryPackTools, description: 'memory_packs (seal, load, transfer, compose, distill, promote)' },
-  { tier: 'tenant', register: registerPhoenixRecoveryTools, description: 'phoenix (snapshot, verify_integrity, recovery_health)' },
-  { tier: 'public', register: registerContextAuthorityTool, description: 'request_context (governed context authority)' },
-  { tier: 'tenant', register: (server, _engine) => registerInstitutionTools(server), description: 'board (list_institutions, list_charters, convene_session, get_session, install_kit)' },
-
-  // --- OPERATOR: Internal infrastructure — never exposed to external clients ---
-  { tier: 'operator', register: registerApproveGateTool, description: 'approve_gate' },
-  { tier: 'tenant', register: registerAgentRightsTool, description: 'agent_rights (Colony Phase 3 — constitutional rights)' },
-  { tier: 'tenant', register: registerPrecedentTools, description: 'board_search_precedent (Colony Layer 1 — precedent case law)' },
-  { tier: 'tenant', register: registerCitizenshipTools, description: 'agent_citizenship_status (Colony Layer 5 — merit-based trust)' },
-  { tier: 'tenant', register: registerBranchAuthorityTools, description: 'branch_authority_status (Colony Layer 4 — separation of powers)' },
-  { tier: 'tenant', register: registerColonyTools, description: 'colony (convene_request, suggestion, health — Colony Autonomy)' },
-  { tier: 'tenant', register: registerContextReviveTool, description: 'context_revive (status, compact, verify, history)' },
-  { tier: 'tenant', register: registerGovernedSamplingTool, description: 'governed_sample (client-mediated governed cognition via MCP Sampling)' },
-  { tier: 'tenant', register: registerChainOfReasoningTools, description: 'chain_of_reasoning (Governed Cognition provenance trail)' },
-  { tier: 'operator', register: registerSRTTools, description: 'srt (run_watchdog, diagnose, approve_repair, generate_postmortem)' },
-  { tier: 'operator', register: registerRemediationPackTools, description: 'remediation (scan_environment, list_packs, dry_run_pack, apply_pack, run_patrol)' },
-];
 
 /** Governed retrieval tools need special handling (no engine param) */
 const GOVERNED_RETRIEVAL_TIER: ToolVisibility = 'tenant';
@@ -160,24 +105,33 @@ const TIER_CEILING: Record<ToolVisibility, Set<ToolVisibility>> = {
  *
  * If ANY step fails, throws — caller decides how to handle.
  */
-export async function createGIAServer(maxVisibility: ToolVisibility = 'operator'): Promise<{
+export async function createGIAServer(
+  maxVisibility: ToolVisibility = 'operator',
+  existingEngine?: GovernanceEngine,
+): Promise<{
   server: McpServer;
   engine: GovernanceEngine;
 }> {
   // Step 1: Load configuration
   const config = GOVERNANCE_CONFIG;
 
-  // Step 2: Initialize CORE governance engine
-  const engine = new GovernanceEngine();
-  engine.classifier.registerVertical(ACE_MAI_CONFIG);
-  if (config.autoRunMode) {
-    engine.enableAutoRun();
-  }
-
-  // Step 3: Validate CORE initialization (now async — recovers ledger from PostgreSQL)
-  await engine.initialize();
-  if (!engine.isHealthy()) {
-    throw new Error('Governance engine failed initialization.');
+  // Step 2-3: Governance engine.
+  // When an existingEngine is supplied (e.g. multiple concurrent worker sessions
+  // for the same tenant), reuse it — its ledger is already recovered and its
+  // GovernedSampling already wired. This avoids triggering a full ForensicLedger
+  // recovery (16k+ entries) per session. Otherwise build + initialize a fresh one.
+  const reuseEngine = existingEngine !== undefined;
+  const engine = existingEngine ?? new GovernanceEngine();
+  if (!reuseEngine) {
+    engine.classifier.registerVertical(ACE_MAI_CONFIG);
+    if (config.autoRunMode) {
+      engine.enableAutoRun();
+    }
+    // Validate CORE initialization (async — recovers ledger from PostgreSQL)
+    await engine.initialize();
+    if (!engine.isHealthy()) {
+      throw new Error('Governance engine failed initialization.');
+    }
   }
 
   // Step 4: Create MCP server
@@ -196,8 +150,12 @@ export async function createGIAServer(maxVisibility: ToolVisibility = 'operator'
   // Step 4b: Initialize Governed Sampling (needs Server ref from McpServer).
   // Sampling uses the underlying server.server; instrumentation is at the tool
   // surface, not the sampling surface (sampling has its own governance path).
-  const sampling = new GovernedSampling(engine, server.server);
-  engine.setSampling(sampling);
+  // Skipped on engine reuse — the shared engine already has its sampling wired,
+  // and the public (worker) tier does not expose the governed_sample tool anyway.
+  if (!reuseEngine) {
+    const sampling = new GovernedSampling(engine, server.server);
+    engine.setSampling(sampling);
+  }
 
   // Step 5: Register MCP tools — filtered by visibility tier.
   // All registrations route through `instrumentedServer` so handlers are wrapped.
@@ -227,12 +185,23 @@ export async function createGIAServer(maxVisibility: ToolVisibility = 'operator'
       const available = TOOL_REGISTRY
         .filter(entry => allowedTiers.has(entry.tier))
         .map(entry => ({ tier: entry.tier, tools: entry.description }));
+      // The two groups registered outside TOOL_REGISTRY. Omitting them made this
+      // tool report 31 groups while the startup banner reported 33 — two
+      // different counts of the same thing from the same process.
+      if (allowedTiers.has(GOVERNED_RETRIEVAL_TIER)) {
+        available.push({ tier: GOVERNED_RETRIEVAL_TIER, tools: 'gia_retrieve, gia_ingest_document (governed retrieval)' });
+      }
+      available.push({ tier: 'public' as ToolVisibility, tools: 'list_available_tools (this tool)' });
       const blocked = TOOL_REGISTRY
         .filter(entry => !allowedTiers.has(entry.tier))
         .map(entry => ({ tier: entry.tier, tools: entry.description, reason: `Requires ${entry.tier} tier access. Current: ${maxVisibility}.` }));
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({
           currentTier: maxVisibility,
+          // Total tools in the catalogue, from the ratified classification map.
+          // Group counts below describe registration units, not tool counts —
+          // one group can register several tools.
+          totalToolsInCatalogue: GIA_TOOL_COUNT,
           availableToolGroups: available.length,
           blockedToolGroups: blocked.length,
           available,
@@ -243,7 +212,15 @@ export async function createGIAServer(maxVisibility: ToolVisibility = 'operator'
   );
   registeredCount++;
 
-  console.error(`[GIA] Tool visibility: ${maxVisibility} — registered ${registeredCount}/${TOOL_REGISTRY.length + 1} tool groups`);
+  // Denominator counts the two registrations that live outside TOOL_REGISTRY:
+  // governed retrieval and the inline list_available_tools. Getting this wrong
+  // printed "registered 33/32 tool groups" — a numerator above its own
+  // denominator, which reads as a bug in the thing doing the reporting.
+  const totalToolGroups = TOOL_REGISTRY.length + 2;
+  console.error(
+    `[GIA] Tool visibility: ${maxVisibility} — registered ${registeredCount}/${totalToolGroups} tool groups ` +
+    `(${GIA_TOOL_COUNT} tools in catalogue)`,
+  );
 
   // Step 6: Register MCP resources (Proxy forwards non-tool methods unchanged)
   registerResources(instrumentedServer, engine);
@@ -301,6 +278,26 @@ async function main(): Promise<void> {
   console.error(`[GIA] Author: William J. Storey III`);
   console.error(`[GIA] Transport: stdio (reference)`);
   console.error(`[GIA] Accepting connections.`);
+
+  // Graceful shutdown — drain in-flight forensic-ledger writes before exit so a
+  // short-lived session (e.g. a scripted client that disconnects immediately)
+  // does not lose queued STARTED/COMPLETED rows (F-5). closePersistence() calls
+  // drainPendingWrites() first, then closes the pool.
+  let shuttingDown = false;
+  const shutdown = async (reason: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`[GIA] Shutting down (${reason}) — draining forensic-ledger writes...`);
+    try {
+      await engine.ledger.closePersistence();
+    } catch (err) {
+      console.error('[GIA] Shutdown drain error:', (err as Error).message);
+    }
+    process.exit(0);
+  };
+  transport.onclose = () => { void shutdown('transport-closed'); };
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
 }
 
 main().catch((error) => {

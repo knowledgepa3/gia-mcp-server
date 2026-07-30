@@ -1,0 +1,21 @@
+{
+  // Publish build. tsconfig.json stays broad so `tsc --noEmit` typechecks the
+  // test suites too; this config is what emits dist/, and it keeps test code
+  // and source maps out of the published artifact. npm 0.4.2 shipped 481 files
+  // including every dist/**/__tests__/*.test.js plus 244 .map files pointing at
+  // source we deliberately do not distribute.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "sourceMap": false,
+    "declarationMap": false
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "sandbox",
+    "tests",
+    "src/**/__tests__/**",
+    "src/**/*.test.ts",
+    "src/**/*.spec.ts"
+  ]
+}

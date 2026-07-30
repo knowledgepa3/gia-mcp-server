@@ -228,15 +228,14 @@ export class GovernedSampling {
       const contentHash = createHash('sha256').update(textContent).digest('hex').slice(0, 16);
 
       // ── Step 8: Score result ─────────────────────────────────────────────
-      const score = this.engine.scorer.score(
-        {
-          integrity: 0.95,    // High: cryptographic transport, hash-verified
-          accuracy: 0.85,     // Moderate: model output, not independently verified
-          compliance: 0.90,   // High: governed request path, policy-validated
-        },
-        SAMPLING_OP_REQUESTED,
-        entry.id,
-      );
+      // The model's output is NEVER independently measured for integrity/accuracy/
+      // compliance here, so we must not fabricate a triple. A prior version wrote a
+      // hardcoded {0.95, 0.85, 0.90} marked scored:true — a fabricated measurement
+      // permanently recorded in the immutable ledger (truth-map finding #3, 2026-06-29).
+      // Emit an explicit NOT-SCORED sentinel instead, matching the deny path (Step 1)
+      // and the control-plane pattern in scorer.scoreDefault(). Transport integrity is
+      // still attested out-of-band via the contentHash metadata below.
+      const score = this.engine.scorer.scoreDefault(SAMPLING_OP_REQUESTED);
 
       // ── Step 9: Complete ledger entry ────────────────────────────────────
       entry.addMetadata('responseModel', result.model);

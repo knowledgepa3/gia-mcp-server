@@ -18,7 +18,7 @@ import {
 } from '../../shared/constants.js';
 import { generateGateId, utcNow } from '../../shared/utils.js';
 import { GateRejectionError } from '../../shared/errors.js';
-import { persistGateRequest, persistGateResolution, checkRemoteGateResolution } from '../persistence/gate-persistence.js';
+import { persistGateRequest, persistGateResolution, checkRemoteGateResolution, getAdvisoryTimeoutMs } from '../persistence/gate-persistence.js';
 import { notifyGateCreated, notifyGateResolved, notifyGateExpired } from './webhook.js';
 
 export type PasskeyEnforcement = 'off' | 'mandatory-only' | 'all';
@@ -128,14 +128,75 @@ export class MaiGate {
       };
     }
 
-    // ADVISORY — auto-approve after timeout (in production: pause + notify)
+    // ADVISORY — pause + notify, auto-APPROVE after timeout (human can reject early)
     if (classification === MaiClassification.ADVISORY) {
-      return {
-        gateId, classification, status: GateStatus.APPROVED,
-        approvedBy: 'TIMEOUT', timestamp: utcNow(),
-        rationale: `ADVISORY gate auto-approved after timeout for ${operation}.`,
-        autoRunMode: false,
-      };
+      const timeoutMs = await getAdvisoryTimeoutMs(this.config.advisoryTimeoutMs);
+      return new Promise<IGateDecision>((resolve, reject) => {
+        const pending: IPendingApproval = {
+          gateId, classification, operation, auditId,
+          requestedAt: utcNow(),
+          ownerRole,
+          escalationLevel: 0,
+          resolve, reject,
+        };
+        this.pendingApprovals.set(gateId, pending);
+
+        persistGateRequest({
+          gateId, classification, operation, auditId,
+          requestedAt: pending.requestedAt,
+          ownerRole,
+          escalationLevel: 0,
+        });
+
+        const expiresAt = new Date(pending.requestedAt.getTime() + timeoutMs);
+        notifyGateCreated({
+          gateId, classification, operation, ownerRole,
+          createdAt: pending.requestedAt.toISOString(),
+          expiresAt: expiresAt.toISOString(),
+        });
+
+        // Poll for early human approval or rejection
+        const POLL_INTERVAL_MS = 3_000;
+        const pollTimer = setInterval(async () => {
+          if (!this.pendingApprovals.has(gateId)) { clearInterval(pollTimer); return; }
+          try {
+            const remote = await checkRemoteGateResolution(gateId);
+            if (!remote) return;
+            clearInterval(pollTimer);
+            if (!this.pendingApprovals.has(gateId)) return;
+            this.pendingApprovals.delete(gateId);
+            if (remote.status === 'APPROVED' || remote.status === 'BREAK_GLASS') {
+              const decision: IGateDecision = {
+                gateId, classification, status: GateStatus.APPROVED,
+                approvedBy: remote.approvedBy, timestamp: utcNow(),
+                rationale: remote.rationale, autoRunMode: false,
+              };
+              notifyGateResolved({ gateId, classification, operation, rationale: remote.rationale, resolvedBy: remote.approvedBy, resolvedAt: new Date().toISOString(), createdAt: pending.requestedAt.toISOString() }, 'APPROVED');
+              resolve(decision);
+            } else {
+              notifyGateResolved({ gateId, classification, operation, rationale: remote.rationale, resolvedBy: remote.approvedBy, resolvedAt: new Date().toISOString(), createdAt: pending.requestedAt.toISOString() }, 'REJECTED');
+              reject(new GateRejectionError(gateId, classification, auditId, remote.rationale));
+            }
+          } catch { /* poll failure non-fatal */ }
+        }, POLL_INTERVAL_MS);
+
+        // Timeout: auto-APPROVE (opposite of MANDATORY which auto-denies)
+        setTimeout(() => {
+          clearInterval(pollTimer);
+          if (!this.pendingApprovals.has(gateId)) return;
+          this.pendingApprovals.delete(gateId);
+          const timeoutSec = Math.round(timeoutMs / 1000);
+          const decision: IGateDecision = {
+            gateId, classification, status: GateStatus.APPROVED,
+            approvedBy: 'TIMEOUT', timestamp: utcNow(),
+            rationale: `ADVISORY gate auto-approved after ${timeoutSec}s — no objection received for ${operation}.`,
+            autoRunMode: false,
+          };
+          persistGateResolution({ gateId, status: 'APPROVED', approvedBy: 'TIMEOUT', rationale: decision.rationale });
+          notifyGateResolved({ gateId, classification, operation, rationale: decision.rationale, resolvedBy: 'TIMEOUT', resolvedAt: decision.timestamp.toISOString(), createdAt: pending.requestedAt.toISOString() }, 'APPROVED');
+          resolve(decision);
+        }, timeoutMs);
+      });
     }
 
     // MANDATORY - register pending approval and wait for human response.

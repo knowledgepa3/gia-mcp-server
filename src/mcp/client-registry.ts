@@ -147,7 +147,7 @@ function getCachedDbAuth(keyHash: string): CachedAuth | null {
 }
 
 function cacheDbAuth(keyHash: string, profile: ClientProfile | null): void {
-  const ttl = profile ? 5 * 60 * 1000 : 30 * 1000; // 5min positive, 30s negative
+  const ttl = profile ? 60 * 1000 : 30 * 1000; // 1min positive, 30s negative — revoked keys invalidate faster
   dbAuthCache.set(keyHash, { profile, expiresAt: Date.now() + ttl });
 }
 
@@ -243,20 +243,29 @@ export class ClientRegistry {
       }
     }
 
-    // Fall back to legacy flat keys
+    // Fall back to legacy flat keys.
+    // These are first-party, env-provisioned PLATFORM keys (GIA_API_KEYS) — not
+    // self-serve customer keys (those come from the DB path above). The managed
+    // agent runtime authenticates with one of these to call its own governance
+    // MCP, and an orchestrator fan-out makes many calls per minute across many
+    // concurrent worker sessions on a SINGLE shared key. The starter tier
+    // (30 req/min, 2 concurrent sessions) throttled that — blocking the fan-out.
+    // First-party platform keys therefore get the enterprise tier
+    // (600 req/min, 50 concurrent sessions). The app-layer per-key limit remains
+    // the real governor; this just sizes it for legitimate platform fan-out.
     const legacyKeys = process.env.GIA_API_KEYS || '';
     const keys = legacyKeys.split(',').map(k => k.trim()).filter(Boolean);
     for (const key of keys) {
       const profile: ClientProfile = {
         clientId: `legacy-${key.slice(0, 8)}`,
-        clientName: `Legacy Client (${key.slice(0, 8)}...)`,
+        clientName: `Platform Client (${key.slice(0, 8)}...)`,
         apiKey: key,
         domain: 'general',
-        tier: 'starter',
+        tier: 'enterprise',
         contactEmail: '',
         tenantId: 'default',
         createdAt: new Date().toISOString(),
-        limits: { ...TIER_DEFAULTS.starter },
+        limits: { ...TIER_DEFAULTS.enterprise },
         allowedToolPrefixes: [],
       };
       this.clients.set(key, profile);
@@ -321,6 +330,19 @@ export class ClientRegistry {
 
     // 2. DB fallback — hash the incoming key and look up
     const keyHash = createHash('sha256').update(apiKey).digest('hex');
+
+    // Rate-limit pre-check — reject before hitting DB if this key hash is over limit
+    const preAuthState = getOrCreateRateState(`preauth:${keyHash.slice(0, 16)}`);
+    const now = Date.now();
+    if (now - preAuthState.minuteWindow.windowStart > 60_000) {
+      preAuthState.minuteWindow = { count: 0, windowStart: now };
+    }
+    preAuthState.minuteWindow.count++;
+    if (preAuthState.minuteWindow.count > 20) {
+      // More than 20 auth attempts/min for this key hash — reject without DB hit
+      console.error(`[GIA-Registry] gia.key.rate_limited keyHash=${keyHash.slice(0, 14)}`);
+      return null;
+    }
 
     // Check cache first
     const cached = getCachedDbAuth(keyHash);

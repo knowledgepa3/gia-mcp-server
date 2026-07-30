@@ -8,12 +8,15 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { MAX_INPUT_LENGTH } from './constants.js';
 
 export function generateAuditId(): string { return uuidv4(); }
 export function generateGateId(): string { return `gate-${uuidv4()}`; }
 
-export function sanitize(input: string): string {
-  return input
+export function sanitize(input: string, maxLength: number = MAX_INPUT_LENGTH): string {
+  // Enforce hard length cap before any processing — prevents regex DoS on unbounded input
+  const bounded = input.length > maxLength ? input.slice(0, maxLength) : input;
+  return bounded
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<[^>]*>/g, '')
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')

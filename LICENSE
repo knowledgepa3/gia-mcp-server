@@ -1,21 +1,53 @@
-MIT License
+GIA MCP Server — Proprietary Software License
 
-Copyright (c) 2025-2026 William J. Storey III / Advanced Consulting Experts (ACE)
+Copyright (c) 2025-2026 William J. Storey III / ACE Advising
+All Rights Reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+NOTICE: This software and all associated documentation, algorithms,
+frameworks, and intellectual property (collectively, "the Software")
+are the proprietary property of William J. Storey III / ACE Advising.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+GRANT OF USE:
+You may install and use the Software in its compiled/distributed form
+for the purpose of governance and compliance operations within your
+own organization, subject to the following restrictions.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+RESTRICTIONS:
+1. You may NOT modify, reverse-engineer, decompile, or disassemble
+   the Software or any portion thereof.
+2. You may NOT redistribute, sublicense, sell, lease, or transfer
+   the Software to any third party without prior written consent.
+3. You may NOT create derivative works based on the Software.
+4. You may NOT remove or alter any proprietary notices, labels,
+   or marks on the Software.
+5. You may NOT use the Software to build a competing product
+   or service.
+
+INTELLECTUAL PROPERTY:
+The following concepts, algorithms, and frameworks embodied in the
+Software are the intellectual property of the author:
+- MAI Framework (Mandatory/Advisory/Informational classification)
+- Storey Threshold (governance health metric, 10-18% escalation band)
+- Forensic Ledger (hash-chained, append-only audit architecture)
+- Governance Scoring Engine (Integrity/Accuracy/Compliance weighted composite)
+- GIA Governance Architecture (the layered governance-as-code pattern)
+
+DISCLAIMER:
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+TERMINATION:
+This license terminates automatically if you violate any of its terms.
+Upon termination, you must destroy all copies of the Software in
+your possession.
+
+For licensing inquiries, partnership opportunities, or enterprise
+agreements, contact:
+
+William J. Storey III
+ACE Advising

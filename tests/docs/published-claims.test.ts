@@ -113,3 +113,30 @@ describe('vendor neutrality', () => {
     expect(headline).not.toMatch(VENDOR_POSITIONING);
   });
 });
+
+describe('license consistency', () => {
+  // The npm package and the public GitHub repo carried CONTRADICTORY licenses:
+  // the export repo had an MIT LICENSE while every published npm version shipped
+  // the proprietary one, and package.json's `SEE LICENSE IN LICENSE` resolved to
+  // opposite terms depending on which artifact you read. A license split is the
+  // most consequential kind of "not as advertised" there is.
+  const license = readFileSync(join(repoRoot, 'LICENSE'), 'utf8');
+
+  it('LICENSE states the proprietary terms the package is distributed under', () => {
+    expect(license).toMatch(/Proprietary Software License/);
+    expect(license).toMatch(/All Rights Reserved/i);
+  });
+
+  it('README license section agrees with the LICENSE file', () => {
+    const section = readme.slice(readme.indexOf('## License'));
+    expect(section).toMatch(/Proprietary/);
+    // Guards against the MIT file silently returning: a README that says
+    // proprietary next to an MIT grant is worse than either one alone.
+    expect(license).not.toMatch(/^MIT License/m);
+  });
+
+  it('package.json points at the LICENSE file rather than naming a different license', () => {
+    const parsed = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { license: string };
+    expect(parsed.license).toBe('SEE LICENSE IN LICENSE');
+  });
+});

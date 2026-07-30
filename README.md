@@ -482,13 +482,11 @@ The governance engine, persistence, authentication, rate limiting, multi-vendor 
 
 ## License
 
-See [LICENSE](LICENSE) in this repository for the terms that apply to this source.
+Proprietary. Copyright (c) 2025-2026 William J. Storey III / Advanced Consulting Experts, LLC. All rights reserved.
 
-The MAI Framework, Storey Threshold, Context Authority, Forensic Ledger architecture, and GIA governance patterns are intellectual property of William J. Storey III / Advanced Consulting Experts, LLC.
+The MAI Framework, Storey Threshold, Context Authority, Forensic Ledger architecture, and GIA governance patterns are intellectual property of the author. See [LICENSE](LICENSE) for terms.
 
-> **Note:** this repository's LICENSE and the LICENSE shipped in the npm package
-> currently differ. Resolving that is a pending owner decision — do not infer the
-> terms of one from the other.
+Earlier snapshots of this repository (v0.3.x) carried an MIT LICENSE file in error; the npm package has always been distributed under the proprietary terms above. Grants already received under that MIT file are not affected by this correction, which applies going forward.
 
 ---
 

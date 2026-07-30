@@ -2,22 +2,22 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.knowledgepa3/gia-mcp-server",
   "title": "GIA — Governed Intelligence Architecture",
-  "description": "Runtime governance layer for AI agents: MAI decision classification, human-in-the-loop gates, hash-chained forensic audit, governed context authority, and compliance mapping (NIST AI RMF, EU AI Act, ISO 42001, SOC 2, CMMC). Model-agnostic — runs embedded, no remote service required.",
+  "description": "Runtime AI governance: decision gates, human approval, hash-chained audit, compliance mapping.",
   "repository": {
     "url": "https://github.com/knowledgepa3/gia-mcp-server",
     "source": "github"
   },
-  "version": "0.4.3",
+  "version": "0.4.4",
   "websiteUrl": "https://gia.aceadvising.com",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "gia-mcp-server",
-      "version": "0.4.3",
+      "version": "0.4.4",
       "transport": {
         "type": "stdio"
       },
-      "environment_variables": [
+      "environmentVariables": [
         {
           "name": "DATABASE_URL",
           "description": "PostgreSQL connection string for a persistent forensic audit trail (optional — the governance engine runs in-memory without it)",

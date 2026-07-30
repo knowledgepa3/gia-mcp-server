@@ -1,6 +1,6 @@
 {
   "name": "gia-mcp-server",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Runtime governance layer for AI agents. Model-agnostic and vendor-neutral — works with any MCP-compatible client, agent, or framework. MAI decision classification, human-in-the-loop gates, hash-chained forensic audit, governed context authority, EU AI Act / NIST / SOC 2 / CMMC mapping.",
   "homepage": "https://gia.aceadvising.com/get-api-key",
   "author": {
@@ -83,5 +83,6 @@
   "overrides": {
     "vite": "^7.3.5",
     "esbuild": "^0.28.1"
-  }
+  },
+  "mcpName": "io.github.knowledgepa3/gia-mcp-server"
 }

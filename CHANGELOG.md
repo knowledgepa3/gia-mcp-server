@@ -2,6 +2,17 @@
 
 All notable changes to GIA MCP Server will be documented in this file.
 
+## [0.4.4] - 2026-07-30
+
+### Fixed
+
+- Restored the `mcpName` field to package.json. The official MCP registry
+  verifies namespace ownership by reading it from the npm-published manifest;
+  the 0.3.x proxy had it and the 0.4.x embedded line dropped it, which is why
+  every registry publish since silently failed and the registry stayed pinned
+  to 0.3.1 with the retired proxy architecture and an auth header the live
+  endpoint rejects. No code changes.
+
 ## [0.4.3] - 2026-07-29
 
 Truth-in-advertising release. A live audit of the published artifact (not the

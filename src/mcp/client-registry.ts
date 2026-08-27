@@ -348,7 +348,9 @@ export class ClientRegistry {
     const cached = getCachedDbAuth(keyHash);
     if (cached) {
       if (!cached.profile) {
-        console.error(`[GIA-Registry] gia.key.auth_failed (cached negative) prefix=${apiKey.substring(0, 14)}`);
+        // Log the hash, never raw key material — a 14-char prefix of the
+        // presented key is credential data in the log stream.
+        console.error(`[GIA-Registry] gia.key.auth_failed (cached negative) hash=${keyHash.substring(0, 12)}`);
       }
       return cached.profile;
     }

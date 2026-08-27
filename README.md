@@ -1,5 +1,7 @@
 # GIA MCP Server
 
+[![M8ven Verified](https://m8ven.ai/badge/mcp/knowledgepa3-gia-mcp-server-sc769s?variant=verified&v=f17d3ce4fb86febba93f16822a8ba7bf)](https://m8ven.ai/mcp/knowledgepa3-gia-mcp-server-sc769s)
+
 **Governance enforcement layer for generative AI agents.** Classify every decision, enforce human approval gates, control what agents can access, score compliance posture, and maintain a cryptographic audit trail. Works with any MCP-compatible AI client or agent framework — model-agnostic and vendor-neutral.
 
 ```
